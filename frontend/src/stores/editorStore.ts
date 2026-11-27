@@ -1,0 +1,1630 @@
+import { create } from 'zustand';
+import { uuid } from '../utils/uuid';
+import { applyAppearance, applyNativeTheme, readAppearance, saveAppearance, themeOf, type Appearance } from '../utils/appearance';
+import { DEFAULT_SCRIPT_PROFILE, normalizeScriptProfile, type ScriptProfile } from '../utils/scriptProfile';
+import { DEFAULT_REVISION_COLOR, DEFAULT_REVISION_SETTINGS, nextRevisionColor, type RevisionSettings } from '../editor/revisionColors';
+import { spellChecker, PROJECT_DICT_TARGET } from '../editor/spellchecker';
+import {
+  NOTE_NUMBER_FORMATS,
+  type NoteNumberFormat,
+  type FootnoteMarkerStyle,
+} from '../utils/noteNumbering';
+
+// ── View-state persistence helpers ──
+const VIEW_STATE_KEY = 'draftcraft:viewState';
+interface ViewState {
+  navigatorOpen?: boolean;
+  indexCardsOpen?: boolean;
+  beatBoardOpen?: boolean;
+  scriptNotesOpen?: boolean;
+  characterProfilesOpen?: boolean;
+  tagsPanelOpen?: boolean;
+  locationDatabaseOpen?: boolean;
+  notesVisible?: boolean;
+  tagsVisible?: boolean;
+  notesActiveTab?: 'script' | 'general';
+  zoomLevel?: number;
+  toolbarMode?: 'compact' | 'comfortable' | 'hidden';
+  characterSortBy?: 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance';
+  grammarRulesEnabled?: Record<string, boolean>;
+  spellingSettings?: SpellingSettings;
+  includeTitlePageInOutput?: boolean;
+}
+
+/** One colour a script has been revised in. */
+export interface RevisionHistoryEntry {
+  color: string;
+  /** ISO date the colour was first used. */
+  date: string;
+}
+
+/** `history` with `color` recorded, if it isn't already. */
+export function withRevisionColor(history: RevisionHistoryEntry[], color: string): RevisionHistoryEntry[] {
+  if (history.some((h) => h.color === color)) return history;
+  return [...history, { color, date: new Date().toISOString() }];
+}
+
+export interface SpellingSettings {
+  /** When true, capitalized unknown words (likely proper nouns) are flagged. */
+  flagProperNouns?: boolean;
+}
+
+const DEFAULT_SPELLING_SETTINGS: Required<SpellingSettings> = {
+  flagProperNouns: false,
+};
+function loadViewState(): ViewState {
+  try {
+    const raw = localStorage.getItem(VIEW_STATE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+function saveViewState(patch: Partial<ViewState>) {
+  try {
+    const current = loadViewState();
+    localStorage.setItem(VIEW_STATE_KEY, JSON.stringify({ ...current, ...patch }));
+  } catch { /* localStorage unavailable */ }
+}
+const _vs = loadViewState();
+
+/**
+ * How tight the chrome is before the writer says otherwise.
+ *
+ * Compact suits a mouse, which lands wherever it is pointed. A finger does not:
+ * the compact toolbar's controls are 22px tall, well under the ~44px both Apple
+ * and Google put the floor at, and on a touch tablet that is the difference between
+ * tapping the font picker and tapping the element menu beside it. Touch gets
+ * comfortable to start with; the View menu still moves it either way, and the
+ * choice is remembered once made.
+ */
+function defaultToolbarMode(): 'compact' | 'comfortable' | 'hidden' {
+  try {
+    if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) {
+      return 'comfortable';
+    }
+  } catch {
+    // matchMedia unavailable (a test runner) — a mouse is the safer assumption.
+  }
+  return 'compact';
+}
+
+// ── Custom dictionary library (named global word lists) ──
+const DICTS_KEY = 'draftcraft:dictionaries';
+const LEGACY_DICT_KEY = 'draftcraft:customDictionary';
+
+function loadCustomDictionaries(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(DICTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        const out: Record<string, string[]> = {};
+        for (const [name, words] of Object.entries(parsed)) {
+          if (Array.isArray(words)) out[name] = words.filter((w): w is string => typeof w === 'string');
+        }
+        return out;
+      }
+    }
+    // Migrate the legacy single-global dictionary into a "Personal" entry.
+    const legacy = localStorage.getItem(LEGACY_DICT_KEY);
+    if (legacy) {
+      try {
+        const arr = JSON.parse(legacy);
+        if (Array.isArray(arr)) {
+          const migrated = { Personal: arr.filter((w): w is string => typeof w === 'string') };
+          localStorage.setItem(DICTS_KEY, JSON.stringify(migrated));
+          return migrated;
+        }
+      } catch { /* fall through */ }
+    }
+  } catch { /* localStorage unavailable */ }
+  return {};
+}
+
+function saveCustomDictionaries(dicts: Record<string, string[]>) {
+  try {
+    localStorage.setItem(DICTS_KEY, JSON.stringify(dicts));
+  } catch { /* localStorage unavailable */ }
+}
+
+const _initialDicts = loadCustomDictionaries();
+// Push the loaded library to the spell checker immediately so it's in effect
+// before any document is opened.
+spellChecker.setGlobalDictionaries(_initialDicts);
+
+// ── Add-to-Dictionary targets (global setting) ──
+// Tracks which dictionaries the "Add to Dictionary" action writes to. Members
+// are either PROJECT_DICT_TARGET or a global-dictionary name.
+const ADD_TARGETS_KEY = 'draftcraft:addTargets';
+function loadAddTargets(): string[] {
+  try {
+    const raw = localStorage.getItem(ADD_TARGETS_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.every((s) => typeof s === 'string') && arr.length > 0) {
+        return arr;
+      }
+    }
+  } catch { /* fall through */ }
+  return [PROJECT_DICT_TARGET];
+}
+function saveAddTargets(targets: string[]) {
+  try { localStorage.setItem(ADD_TARGETS_KEY, JSON.stringify(targets)); } catch { /* noop */ }
+}
+const _initialAddTargets = loadAddTargets();
+spellChecker.setAddTargets(_initialAddTargets);
+
+/** Built-in screenplay element types — fixed set, hardcoded as Tiptap extensions. */
+export type BuiltInElementType =
+  | 'sceneHeading'
+  | 'action'
+  | 'character'
+  | 'dialogue'
+  | 'parenthetical'
+  | 'transition'
+  | 'general'
+  | 'shot'
+  | 'newAct'
+  | 'endOfAct'
+  | 'lyrics'
+  | 'showEpisode'
+  | 'castList'
+  // Fountain's two non-printing structural elements — see utils/nonPrinting.ts.
+  | 'section'
+  | 'note'
+  | 'titlePage';
+
+/** Element type id — built-in literal or any custom id declared by a template.
+ *  The `(string & {})` trick keeps autocomplete on built-ins while accepting any string. */
+export type ElementType = BuiltInElementType | (string & {});
+
+/** Display labels for built-in element types. Keyed permissively as `string` so callers
+ *  can index with any `ElementType` (custom ids return undefined; pair with `|| fallback`). */
+export const ELEMENT_LABELS: Record<string, string> = {
+  sceneHeading: 'Scene Heading',
+  action: 'Action',
+  character: 'Character',
+  dialogue: 'Dialogue',
+  parenthetical: 'Parenthetical',
+  transition: 'Transition',
+  // "General" is Final Draft's own term and stays the interchange key, but on
+  // its own it says nothing about what the element is for. Fade In calls the
+  // same thing "Normal Text", which is why writers coming from it could not
+  // find this. The suffix is display only — the id stays `general`.
+  general: 'General (Unformatted text)',
+  shot: 'Shot',
+  newAct: 'New Act',
+  endOfAct: 'End of Act',
+  lyrics: 'Lyrics',
+  showEpisode: 'Show/Episode',
+  castList: 'Cast List',
+  section: 'Section (Outline)',
+  note: 'Note (Not printed)',
+  titlePage: 'Title Page',
+};
+
+/** Header/footer content for left, center, right positions.
+ *  Dynamic fields: {page} = page number, {pages} = total pages,
+ *  {title} = document title, {date} = current date, {revision} = revision color. */
+export interface HeaderFooterContent {
+  left: string;
+  center: string;
+  right: string;
+}
+
+export const DEFAULT_HEADER_CONTENT: HeaderFooterContent = {
+  left: '',
+  center: '',
+  right: '{page}.',
+};
+
+export const DEFAULT_FOOTER_CONTENT: HeaderFooterContent = {
+  left: '',
+  center: '',
+  right: '',
+};
+
+/** "Mores & Continueds" config (per-document, like Final Draft). Controls the two
+ *  independent kinds of dialogue continuation and their marker text. Note: the
+ *  character (CONT'D) never carries across a scene heading — that is a fixed
+ *  industry rule, not a setting. */
+export interface MoresContds {
+  /** Append (CONT'D) to a character cue that resumes speaking after action
+   *  WITHIN the same scene. */
+  characterContd: boolean;
+  /** Show (MORE) at the bottom of a page and CHARACTER (CONT'D) at the top of the
+   *  next when a single dialogue block splits across a page break. */
+  dialogueBreakContd: boolean;
+  /** Marker for continued dialogue, e.g. "(CONT'D)". */
+  contdText: string;
+  /** Marker shown when dialogue continues onto the next page, e.g. "(MORE)". */
+  moreText: string;
+}
+
+export const DEFAULT_MORES_CONTDS: MoresContds = {
+  characterContd: true,
+  dialogueBreakContd: true,
+  contdText: "(CONT'D)",
+  moreText: '(MORE)',
+};
+
+/** Always returns a complete MoresContds, filling any missing/legacy fields with
+ *  defaults so older documents (saved before this feature) behave sensibly. */
+export function resolveMoresContds(layout: PageLayout | undefined): MoresContds {
+  const m = layout?.moresContds;
+  const resolved: MoresContds = { ...DEFAULT_MORES_CONTDS, ...(m ?? {}) };
+  if (!resolved.contdText.trim()) resolved.contdText = DEFAULT_MORES_CONTDS.contdText;
+  if (!resolved.moreText.trim()) resolved.moreText = DEFAULT_MORES_CONTDS.moreText;
+  return resolved;
+}
+
+/**
+ * Footnote / endnote configuration, mirroring Word's Footnote and Endnote
+ * dialog.
+ *
+ * `enabled` is the master switch and is OFF by default, which together with a
+ * note's own `printInScript` flag (also off by default) is what guarantees that
+ * a document written before this feature existed paginates and exports exactly
+ * as it always did.
+ */
+export interface FootnoteSettings {
+  /** Master switch. While this is off, a note's own print flag is inert. */
+  enabled: boolean;
+  /** At the foot of the page carrying the reference, or at the end of the script. */
+  placement: 'footnote' | 'endnote';
+  numberFormat: NoteNumberFormat;
+  markerStyle: FootnoteMarkerStyle;
+  /** Word's "Start at". */
+  startAt: number;
+  /** Word's "Numbering". Endnotes have no pages, so they are always continuous. */
+  numbering: 'continuous' | 'restartEachPage';
+  /** Whether printed notes reach the PDF, Word and Final Draft exports. */
+  includeInExports: boolean;
+}
+
+export const DEFAULT_FOOTNOTES: FootnoteSettings = {
+  enabled: false,
+  placement: 'footnote',
+  numberFormat: 'arabic',
+  markerStyle: 'superscript',
+  startAt: 1,
+  numbering: 'continuous',
+  includeInExports: true,
+};
+
+/** Always returns a complete FootnoteSettings, filling missing/legacy fields with
+ *  defaults so a document saved before this existed reads back as "off" rather
+ *  than as undefined. Invalid enum values fall back rather than propagating. */
+export function resolveFootnotes(layout: PageLayout | undefined): FootnoteSettings {
+  const f: FootnoteSettings = { ...DEFAULT_FOOTNOTES, ...(layout?.footnotes ?? {}) };
+  const n = Number(f.startAt);
+  f.startAt = Number.isFinite(n) ? Math.min(9999, Math.max(1, Math.round(n))) : 1;
+  if (f.placement !== 'endnote') f.placement = 'footnote';
+  if (f.markerStyle !== 'bracketed') f.markerStyle = 'superscript';
+  if (!NOTE_NUMBER_FORMATS.some((x) => x.id === f.numberFormat)) f.numberFormat = 'arabic';
+  // Endnotes are one list at the end of the script; there is no page to restart
+  // on, and Word greys the control out for the same reason.
+  if (f.placement === 'endnote' || f.numbering !== 'restartEachPage') f.numbering = 'continuous';
+  f.enabled = f.enabled === true;
+  f.includeInExports = f.includeInExports !== false;
+  return f;
+}
+
+export interface PageLayout {
+  pageWidth: number;     // inches
+  pageHeight: number;    // inches
+  topMargin: number;     // points
+  bottomMargin: number;  // points
+  headerMargin: number;  // points
+  footerMargin: number;  // points
+  leftMargin: number;    // inches (from page edge to content start)
+  rightMargin: number;   // inches (from content end to page edge)
+  headerContent: HeaderFooterContent;
+  footerContent: HeaderFooterContent;
+  /** Start showing the header/footer on this printed page number — compared
+   *  against the number the page actually carries, not its position in the file.
+   *  Default 2 for the header, so the first script page is unnumbered (the
+   *  industry standard); default 1 for the footer, which is empty by default. */
+  headerStartPage: number;
+  footerStartPage: number;
+  /** The number printed on the FIRST script page (the title page is never
+   *  numbered and never counted). Default 1. Raise it when the script's opening
+   *  sheet should read as a later page — e.g. a synopsis occupies page 1, so the
+   *  script itself starts at 2. Optional for back-compat with documents saved
+   *  before this existed — read via resolveHeaderFooter(). */
+  startingPageNumber?: number;
+  /** Dialogue continuation ("Mores & Continueds") config. Optional for back-compat
+   *  with documents saved before this existed — read via resolveMoresContds(). */
+  moresContds?: MoresContds;
+  /** Footnote/endnote config. Optional for back-compat with documents saved
+   *  before this existed — read via resolveFootnotes(). */
+  footnotes?: FootnoteSettings;
+}
+
+export const DEFAULT_PAGE_LAYOUT: PageLayout = {
+  pageWidth: 8.26,
+  pageHeight: 11.69,
+  topMargin: 72,
+  bottomMargin: 72,
+  headerMargin: 36,
+  footerMargin: 36,
+  leftMargin: 1.50,       // Final Draft default LeftIndent for Action
+  rightMargin: 0.76,      // 8.26 - 7.50 (default RightIndent)
+  headerContent: { ...DEFAULT_HEADER_CONTENT },
+  footerContent: { ...DEFAULT_FOOTER_CONTENT },
+  headerStartPage: 2,
+  footerStartPage: 1,
+  startingPageNumber: 1,
+  moresContds: { ...DEFAULT_MORES_CONTDS },
+  footnotes: { ...DEFAULT_FOOTNOTES },
+};
+
+/** Header/footer settings with every legacy gap filled in. Documents saved
+ *  before a given field existed read back as the default rather than NaN or
+ *  undefined, which is what every consumer (editor, PDF, DOCX) relies on. */
+export interface HeaderFooterSettings {
+  headerContent: HeaderFooterContent;
+  footerContent: HeaderFooterContent;
+  headerStartPage: number;
+  footerStartPage: number;
+  startingPageNumber: number;
+}
+
+export function resolveHeaderFooter(layout: PageLayout | undefined): HeaderFooterSettings {
+  const clampPage = (v: unknown, fallback: number): number => {
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(9999, Math.max(1, Math.round(n)));
+  };
+  return {
+    headerContent: { ...DEFAULT_HEADER_CONTENT, ...(layout?.headerContent ?? {}) },
+    footerContent: { ...DEFAULT_FOOTER_CONTENT, ...(layout?.footerContent ?? {}) },
+    headerStartPage: clampPage(layout?.headerStartPage, 2),
+    footerStartPage: clampPage(layout?.footerStartPage, 1),
+    startingPageNumber: clampPage(layout?.startingPageNumber, 1),
+  };
+}
+
+/** The number printed on a script page. `index` is 1-based within the script,
+ *  ignoring the title page; the offset shifts it so the first sheet can read as
+ *  a later page. */
+export function printedPageNumber(index: number, startingPageNumber: number): number {
+  return index + startingPageNumber - 1;
+}
+
+/** Resolve the dynamic field placeholders in one header/footer slot. Shared by
+ *  the editor, the PDF exporter and the settings preview so all three agree on
+ *  what a template renders to. `pageNum`/`totalPages` are PRINTED numbers —
+ *  already shifted by the starting-number offset. */
+export function resolveHFFields(
+  text: string,
+  /** A number, or a locked page's label such as "12A". */
+  pageNum: number | string,
+  totalPages: number,
+  title: string,
+  revisionColor: string,
+): string {
+  if (!text) return '';
+  return text
+    .replace(/\{page\}/gi, String(pageNum))
+    .replace(/\{pages\}/gi, String(totalPages))
+    .replace(/\{title\}/gi, title)
+    .replace(/\{date\}/gi, new Date().toLocaleDateString())
+    .replace(/\{revision\}/gi, revisionColor);
+}
+
+/** True when a band with this content should be drawn on the given printed page. */
+export function showsHeaderFooter(
+  content: HeaderFooterContent,
+  printedPage: number,
+  startPage: number,
+): boolean {
+  if (!content.left && !content.center && !content.right) return false;
+  return printedPage >= startPage;
+}
+
+export interface SceneInfo {
+  id: string;
+  heading: string;
+  /** "12", or "12A" for a scene added while numbers are locked. */
+  sceneNumber: string | null;
+  color: string;
+  synopsis: string;
+}
+
+export const NOTE_COLORS = [
+  { name: 'Yellow', hex: '#f4d35e' },
+  { name: 'Red', hex: '#e06060' },
+  { name: 'Blue', hex: '#6fa8dc' },
+  { name: 'Green', hex: '#6abf69' },
+  { name: 'Orange', hex: '#e89b4f' },
+  { name: 'Purple', hex: '#b58ee0' },
+] as const;
+
+export type NoteColor = typeof NOTE_COLORS[number]['name'];
+
+export interface NoteInfo {
+  id: string;
+  content: string;
+  /** Anchored text snippet the note is attached to */
+  anchorText: string;
+  /** Element type where the note is anchored */
+  elementType: string;
+  /** Contextual label — e.g. character name, scene heading text */
+  contextLabel: string;
+  /** Note color for categorization */
+  color: NoteColor;
+  createdAt: string;
+  /** Optional scene context */
+  sceneId: string | null;
+  /** Print this note in the screenplay, as a footnote or an endnote.
+   *  Optional on purpose: a document saved before this existed reads back
+   *  undefined, which is off, so there is nothing to migrate. */
+  printInScript?: boolean;
+  /** Where this note prints, overriding the document's own Location setting.
+   *  Absent — the usual case — means it follows the document, so changing the
+   *  Location moves every note that has not been given one of its own. */
+  printPlacement?: NotePlacement;
+  /** Height in 12pt lines of this note's images, measured once after they load
+   *  and then persisted, so the space reserved on the page stops guessing. */
+  printImageLines?: number;
+}
+
+/** Where a printing note goes. */
+export type NotePlacement = 'footnote' | 'endnote';
+
+/** Whether a note actually reaches the page.
+ *
+ *  Nothing should test `printInScript` directly: an empty note is never worth a
+ *  number, and the placeholder records that orphan reconciliation synthesises
+ *  for a mark with no note have empty content by construction. */
+export function noteWillPrint(note: NoteInfo | undefined | null): boolean {
+  return !!note && note.printInScript === true && note.content.trim().length > 0;
+}
+
+/** Where this note actually goes: its own choice, or the document's. */
+export function effectiveNotePlacement(
+  note: NoteInfo | undefined | null,
+  settings: FootnoteSettings,
+): NotePlacement {
+  return note?.printPlacement ?? settings.placement;
+}
+
+/** Filter state that can be set externally (e.g. from context menu) */
+export interface NoteFilter {
+  elementType: string | null;
+  contextLabel: string | null;
+  color: NoteColor | null;
+  /** If set, show only this specific note */
+  noteId: string | null;
+}
+
+/** A general note attached to the screenplay file (not anchored to any text) */
+export interface GeneralNote {
+  id: string;
+  title: string;
+  content: string;
+  color: NoteColor;
+  createdAt: string;
+  /** Print this note in the screenplay. A general note is anchored to nothing,
+   *  so there is no place in the script to put a reference marker and no page
+   *  it belongs to — it can only ever be an endnote, whatever the document's
+   *  placement setting says. Optional, so older documents read back as off. */
+  printInScript?: boolean;
+  /** Measured image height, cached the way an anchored note's is. */
+  printImageLines?: number;
+}
+
+/** Whether a general note reaches the page. Same rule as an anchored one:
+ *  an empty note is never worth a number. */
+export function generalNoteWillPrint(note: GeneralNote | undefined | null): boolean {
+  return !!note && note.printInScript === true && note.content.trim().length > 0;
+}
+
+// ── Production Tagging (Final Draft TagData) ──
+
+export interface TagCategory {
+  id: string;
+  name: string;
+  color: string;
+  isBuiltIn: boolean;
+}
+
+export interface TagItem {
+  id: string;
+  categoryId: string;
+  /** Entity name — the reusable label for this tag (e.g. "Protagonist Residence"). */
+  name: string;
+  /** Original highlighted text (kept for backward compat). */
+  text: string;
+  /** Detailed notes/information about this tagged entity. */
+  notes: string;
+  sceneId: string | null;
+  elementType: string;
+  createdAt: string;
+}
+
+export const DEFAULT_TAG_CATEGORIES: TagCategory[] = [
+  { id: 'cast', name: 'Cast', color: '#e06060', isBuiltIn: true },
+  { id: 'extras', name: 'Extras', color: '#c0392b', isBuiltIn: true },
+  { id: 'stunts', name: 'Stunts', color: '#e74c3c', isBuiltIn: true },
+  { id: 'vehicles', name: 'Vehicles', color: '#e06c9f', isBuiltIn: true },
+  { id: 'props', name: 'Props', color: '#9370DB', isBuiltIn: true },
+  { id: 'special-effects', name: 'Special Effects', color: '#5dade2', isBuiltIn: true },
+  { id: 'costumes', name: 'Costumes', color: '#1abc9c', isBuiltIn: true },
+  { id: 'makeup', name: 'Makeup/Hair', color: '#45b39d', isBuiltIn: true },
+  { id: 'animals', name: 'Animals', color: '#6abf69', isBuiltIn: true },
+  { id: 'animal-handler', name: 'Animal Handler', color: '#27ae60', isBuiltIn: true },
+  { id: 'music', name: 'Music', color: '#f4d35e', isBuiltIn: true },
+  { id: 'sound', name: 'Sound', color: '#f0b429', isBuiltIn: true },
+  { id: 'set-dressing', name: 'Set Dressing', color: '#d4a373', isBuiltIn: true },
+  { id: 'greenery', name: 'Greenery', color: '#2ecc71', isBuiltIn: true },
+  { id: 'special-equipment', name: 'Special Equipment', color: '#8e44ad', isBuiltIn: true },
+  { id: 'security', name: 'Security', color: '#7f8c8d', isBuiltIn: true },
+  { id: 'additional-labor', name: 'Additional Labor', color: '#95a5a6', isBuiltIn: true },
+  { id: 'vfx', name: 'Visual Effects', color: '#3498db', isBuiltIn: true },
+  { id: 'optical-fx', name: 'Optical FX', color: '#ADD8E6', isBuiltIn: true },
+  { id: 'mechanical-fx', name: 'Mechanical FX', color: '#4169E1', isBuiltIn: true },
+];
+
+export interface CharacterProfile {
+  /** Uppercase canonical character name */
+  name: string;
+  /** Rich text description / bio (HTML string; maps to FDX CastMember Description as plain text) */
+  description: string;
+  /** Highlight color hex (Final Draft CharacterHighlighting) */
+  color: string;
+  /** Whether highlighting is enabled for this character */
+  highlighted: boolean;
+  /** Structured metadata (Final Draft Character Navigator fields) */
+  gender: string;
+  age: string;
+  /** Role in the story: Lead, Supporting, Featured, Background, Day Player */
+  role: string;
+  /** Rich text backstory / character history (HTML string; DraftCraft-only, not in FDX) */
+  backstory: string;
+  /** Character arc — how the character changes through the story (HTML string; DraftCraft-only) */
+  arc: string;
+  /** Dialogue voice profile (DraftCraft-only) */
+  speechPattern: string;
+  vocabulary: string;
+  verbalTics: string;
+  sampleDialogue: string;
+  /** Asset IDs of images associated with this character */
+  images: string[];
+}
+
+/**
+ * A character profile read back from a saved script, as the fields
+ * upsertCharacterProfile takes.
+ *
+ * Every field is carried, including ones added after a script was written.
+ * The two loaders in ScreenplayEditor
+ * used to copy the fields one by one, and a field missing from their list was
+ * silently dropped on open — then gone for good at the next save.
+ */
+export function savedProfileFields(prof: Record<string, unknown>): Partial<Omit<CharacterProfile, 'name'>> {
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const fields: Partial<Omit<CharacterProfile, 'name'>> = {
+    description: str(prof.description),
+    color: str(prof.color),
+    highlighted: prof.highlighted === true,
+    gender: str(prof.gender),
+    age: str(prof.age),
+    role: str(prof.role),
+    backstory: str(prof.backstory),
+    arc: str(prof.arc),
+    speechPattern: str(prof.speechPattern),
+    vocabulary: str(prof.vocabulary),
+    verbalTics: str(prof.verbalTics),
+    sampleDialogue: str(prof.sampleDialogue),
+    images: Array.isArray(prof.images) ? (prof.images as string[]) : [],
+  };
+  return fields;
+}
+
+export interface CharacterRelationship {
+  id: string;
+  characterA: string;
+  characterB: string;
+  type: string;
+  description: string;
+  dynamic: string;
+}
+
+export interface BeatColumn {
+  id: string;
+  title: string;
+  position: number;
+  width: number; // pixels, 0 = auto/fill
+}
+
+export interface BeatLinkPreview {
+  url: string;
+  title: string;
+  description: string;
+  image: string;
+  siteName: string;
+}
+
+export interface BeatInfo {
+  id: string;
+  title: string;
+  description: string;
+  columnId: string;
+  position: number;
+  color: string;
+  imageUrl: string;
+  cardWidth: number;   // pixels, 0 = fill column
+  cardHeight: number;  // pixels, 0 = auto
+  x: number;           // custom-arrange: absolute X position on canvas
+  y: number;           // custom-arrange: absolute Y position on canvas
+  imageHeight: number; // pixels, 0 = default (140px)
+  linkPreviews?: BeatLinkPreview[]; // cached link preview metadata
+}
+
+export type BeatArrangeMode = 'auto' | 'custom';
+
+interface EditorState {
+  // Current element type
+  activeElement: ElementType;
+  setActiveElement: (el: ElementType) => void;
+
+  // Document info
+  documentTitle: string;
+  setDocumentTitle: (title: string) => void;
+  pageCount: number;
+  setPageCount: (count: number) => void;
+  currentPage: number;
+  setCurrentPage: (page: number) => void;
+
+  /**
+   * Whether print, PDF and DOCX draw the title page. On unless turned off.
+   *
+   * Kept here rather than on `PageLayout` because it is the writer's habit, not
+   * the script's: it belongs to the person printing, follows them from one
+   * document to the next, and must not travel inside a .dcraft file or a collab
+   * session. Persisted per device in the view state.
+   *
+   * Only rendered output honours it. FDX, Fountain, Fade In/OSF and .dcraft
+   * always carry the title-page data — sending a script somewhere is not the
+   * same as editing it.
+   */
+  includeTitlePageInOutput: boolean;
+  toggleIncludeTitlePageInOutput: () => void;
+
+  // Scene navigator
+  scenes: SceneInfo[];
+  setScenes: (scenes: SceneInfo[]) => void;
+  navigatorOpen: boolean;
+  toggleNavigator: () => void;
+
+  // Panels
+  indexCardsOpen: boolean;
+  toggleIndexCards: () => void;
+  beatBoardOpen: boolean;
+  toggleBeatBoard: () => void;
+  statisticsOpen: boolean;
+  setStatisticsOpen: (open: boolean) => void;
+  statisticsScrollTo: string | null;
+  setStatisticsScrollTo: (id: string | null) => void;
+  scriptNotesOpen: boolean;
+  toggleScriptNotes: () => void;
+  notesActiveTab: 'script' | 'general';
+  setNotesActiveTab: (tab: 'script' | 'general') => void;
+  notesVisible: boolean;
+  setNotesVisible: (v: boolean) => void;
+
+  // Scene synopsis & color
+  updateSceneSynopsis: (id: string, synopsis: string) => void;
+  updateSceneColor: (id: string, color: string) => void;
+
+  // Notes
+  notes: NoteInfo[];
+  setNotes: (notes: NoteInfo[]) => void;
+  addNote: (note: Omit<NoteInfo, 'id' | 'createdAt'>) => string;
+  updateNote: (id: string, updates: Partial<Omit<NoteInfo, 'id' | 'createdAt'>>) => void;
+  deleteNote: (id: string) => void;
+  noteFilter: NoteFilter;
+  setNoteFilter: (filter: NoteFilter) => void;
+
+  // General notes (file-level, not anchored to text)
+  generalNotes: GeneralNote[];
+  setGeneralNotes: (notes: GeneralNote[]) => void;
+  addGeneralNote: (note: Omit<GeneralNote, 'id' | 'createdAt'>) => string;
+  updateGeneralNote: (id: string, updates: Partial<Omit<GeneralNote, 'id' | 'createdAt'>>) => void;
+  deleteGeneralNote: (id: string) => void;
+
+  // Beats
+  beatArrangeMode: BeatArrangeMode;
+  setBeatArrangeMode: (mode: BeatArrangeMode) => void;
+  beatColumns: BeatColumn[];
+  setBeatColumns: (columns: BeatColumn[]) => void;
+  addBeatColumn: (title: string) => string;
+  updateBeatColumn: (id: string, updates: Partial<{ title: string; position: number; width: number }>) => void;
+  deleteBeatColumn: (id: string) => void;
+  beats: BeatInfo[];
+  setBeats: (beats: BeatInfo[]) => void;
+  addBeat: (title: string, columnId: string) => void;
+  updateBeat: (id: string, updates: Partial<{ title: string; description: string; columnId: string; position: number; color: string; imageUrl: string; cardWidth: number; cardHeight: number; x: number; y: number; imageHeight: number }>) => void;
+  deleteBeat: (id: string) => void;
+  // Beat undo/redo
+  beatUndo: () => void;
+  beatRedo: () => void;
+  canBeatUndo: boolean;
+  canBeatRedo: boolean;
+  _beatUndoStack: { beats: BeatInfo[]; beatColumns: BeatColumn[] }[];
+  _beatRedoStack: { beats: BeatInfo[]; beatColumns: BeatColumn[] }[];
+  _beatSnapshotTime: number;
+  _beatIsUndoing: boolean;
+
+  // Scene numbering
+  sceneNumbersVisible: boolean;
+  setSceneNumbersVisible: (v: boolean) => void;
+  sceneNumbersLocked: boolean;
+  setSceneNumbersLocked: (v: boolean) => void;
+  /** Sections of an opened .fdx that DraftCraft does not model, kept so a save can write them back. */
+  fdxRaw: import('../utils/fdxPreserve').FdxRaw | null;
+  setFdxRaw: (v: import('../utils/fdxPreserve').FdxRaw | null) => void;
+
+  /**
+   * Per-document override for the space before a scene heading, in points.
+   * `null` — the normal case — means "follow the formatting template".
+   *
+   * Exists so that raising the industry-standard default from one blank line to
+   * two does not silently repaginate scripts written under the old default. A
+   * document saved before the change is loaded with this pinned to 12 and the
+   * writer is asked once whether to adopt the standard; choosing to keep the old
+   * spacing records 12 here for good.
+   */
+  sceneHeadingSpaceBefore: number | null;
+  setSceneHeadingSpaceBefore: (v: number | null) => void;
+
+  // Revision — saved with the script (see utils/revisionState.ts)
+  revisionMode: boolean;
+  revisionColor: string;
+  /** Each colour this script has been revised in, first use first. */
+  revisionHistory: RevisionHistoryEntry[];
+  /** Colour revised text in its revision colour (screen only). */
+  showRevisionColors: boolean;
+  setRevisionMode: (on: boolean) => void;
+  setRevisionColor: (color: string) => void;
+  /** Move on to the next colour in the production sequence and turn the mode on. */
+  advanceRevisionColor: () => void;
+  setRevisionHistory: (h: RevisionHistoryEntry[]) => void;
+  setShowRevisionColors: (on: boolean) => void;
+  /** Mark characters and coloured-page output — saved with the script. */
+  revisionSettings: RevisionSettings;
+  setRevisionSettings: (patch: Partial<RevisionSettings>) => void;
+  /**
+   * The writer's pacing and genres — saved with the script (`_scriptProfile`).
+   * Pacing scales the runtime estimate; genres are descriptive only.
+   */
+  scriptProfile: ScriptProfile;
+  setScriptProfile: (profile: Partial<ScriptProfile>) => void;
+  /** Format ▸ Genre & Pacing… */
+  scriptProfileOpen: boolean;
+  setScriptProfileOpen: (open: boolean) => void;
+  /**
+   * Printed page labels while pages are locked ("12", "12A", "13-14"), index
+   * 0 being the script's first page; null when they are not. Derived from the
+   * document by the pagination plugin — see utils/lockedPages.ts.
+   */
+  pageLabels: string[] | null;
+  setPageLabels: (labels: string[] | null) => void;
+  /** Back to defaults — a new or freshly loaded document. */
+  resetRevisionState: () => void;
+
+  // Character profiles (Final Draft CastList + CharacterHighlighting)
+  characters: string[];
+  setCharacters: (names: string[]) => void;
+  addCharacter: (name: string) => void;
+  characterProfiles: CharacterProfile[];
+  setCharacterProfiles: (profiles: CharacterProfile[]) => void;
+  upsertCharacterProfile: (name: string, updates: Partial<Omit<CharacterProfile, 'name'>>) => void;
+  deleteCharacterProfile: (name: string) => void;
+  characterRelationships: CharacterRelationship[];
+  setCharacterRelationships: (rels: CharacterRelationship[]) => void;
+  upsertCharacterRelationship: (rel: CharacterRelationship) => void;
+  deleteCharacterRelationship: (id: string) => void;
+  characterProfilesOpen: boolean;
+  toggleCharacterProfiles: () => void;
+  selectedCharacter: string | null;
+  setSelectedCharacter: (name: string | null) => void;
+
+  // Production tags
+  tagCategories: TagCategory[];
+  setTagCategories: (cats: TagCategory[]) => void;
+  addTagCategory: (name: string, color: string) => string;
+  deleteTagCategory: (id: string) => void;
+  tags: TagItem[];
+  setTags: (tags: TagItem[]) => void;
+  addTag: (tag: Omit<TagItem, 'id' | 'createdAt' | 'name'> & { name?: string }) => string;
+  updateTag: (id: string, updates: Partial<Pick<TagItem, 'notes' | 'categoryId' | 'name'>>) => void;
+  deleteTag: (id: string) => void;
+  tagsVisible: boolean;
+  setTagsVisible: (v: boolean) => void;
+  tagsPanelOpen: boolean;
+  toggleTagsPanel: () => void;
+  locationDatabaseOpen: boolean;
+  toggleLocationDatabase: () => void;
+  /** When set, the Tags panel shows a "select category" prompt for this selection */
+  pendingTagSelection: { from: number; to: number; text: string; elementType: string; sceneId: string | null } | null;
+  setPendingTagSelection: (sel: { from: number; to: number; text: string; elementType: string; sceneId: string | null } | null) => void;
+  /** When set, the Tags panel auto-expands this tag for editing */
+  editingTagId: string | null;
+  setEditingTagId: (id: string | null) => void;
+
+  // Zoom
+  zoomLevel: number;
+  setZoomLevel: (level: number) => void;
+  zoomPanelOpen: boolean;
+  setZoomPanelOpen: (open: boolean) => void;
+
+  // Font
+  fontFamily: string;
+  setFontFamily: (font: string) => void;
+  fontSize: number;
+  setFontSize: (size: number) => void;
+
+  // Page layout
+  pageLayout: PageLayout;
+  setPageLayout: (layout: PageLayout) => void;
+
+  // Theme — `appearance` is the user's choice (remembered); `theme` is the
+  // light/dark half of it, for code that only cares about the interface.
+  appearance: Appearance;
+  setAppearance: (a: Appearance) => void;
+  theme: 'dark' | 'light';
+  setTheme: (t: 'dark' | 'light') => void;
+
+  // Toolbar display mode
+  toolbarMode: 'compact' | 'comfortable' | 'hidden';
+  setToolbarMode: (mode: 'compact' | 'comfortable' | 'hidden') => void;
+
+  // Character sort preference
+  characterSortBy: 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance';
+  setCharacterSortBy: (sort: 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance') => void;
+
+  // Navigator panel width (for floating menu positioning)
+  navPanelWidth: number;
+  setNavPanelWidth: (w: number) => void;
+
+  // Spell check
+  spellCheckEnabled: boolean;
+  toggleSpellCheck: () => void;
+  setSpellCheckEnabled: (v: boolean) => void;
+  spellModalOpen: boolean;
+  setSpellModalOpen: (open: boolean) => void;
+
+  // Grammar / writing suggestions
+  grammarCheckEnabled: boolean;
+  toggleGrammarCheck: () => void;
+  setGrammarCheckEnabled: (v: boolean) => void;
+  grammarModalOpen: boolean;
+  setGrammarModalOpen: (open: boolean) => void;
+  grammarRulesPanelOpen: boolean;
+  setGrammarRulesPanelOpen: (open: boolean) => void;
+  /** Per-rule on/off switch. Missing key = enabled by default. */
+  grammarRulesEnabled: Record<string, boolean>;
+  setGrammarRuleEnabled: (ruleId: string, enabled: boolean) => void;
+  /** Spell-checker preferences (proper-noun handling, etc.). */
+  spellingSettings: Required<SpellingSettings>;
+  setSpellingSetting: <K extends keyof SpellingSettings>(key: K, value: Required<SpellingSettings>[K]) => void;
+  /** Global custom-dictionary library, keyed by user-chosen name. */
+  customDictionaries: Record<string, string[]>;
+  createGlobalDictionary: (name: string) => void;
+  renameGlobalDictionary: (oldName: string, newName: string) => void;
+  deleteGlobalDictionary: (name: string) => void;
+  setGlobalDictionaryWords: (name: string, words: string[]) => void;
+  dictionaryLibraryOpen: boolean;
+  setDictionaryLibraryOpen: (open: boolean) => void;
+  /** Dictionaries that "Add to Dictionary" writes to. Members are either
+   *  PROJECT_DICT_TARGET (the per-project private dict) or a global-dict name. */
+  addTargets: string[];
+  setAddTargets: (targets: string[]) => void;
+  /** Append a word to a global dictionary (used by add-to-dictionary submenu). */
+  appendWordToGlobalDictionary: (name: string, word: string) => void;
+  // Track changes
+  trackChangesEnabled: boolean;
+  trackChangesLabel: string;
+  setTrackChangesEnabled: (v: boolean) => void;
+  setTrackChangesLabel: (v: string) => void;
+  compareVersionOpen: boolean;
+  setCompareVersionOpen: (v: boolean) => void;
+
+  // Save status
+  saveStatus: 'idle' | 'unsaved' | 'saving' | 'saved' | 'error';
+  saveError: string | null;
+  setSaveStatus: (status: 'idle' | 'unsaved' | 'saving' | 'saved' | 'error', error?: string | null) => void;
+
+  // Dialogs
+  searchOpen: boolean;
+  setSearchOpen: (open: boolean) => void;
+  goToPageOpen: boolean;
+  setGoToPageOpen: (open: boolean) => void;
+  titlePageEditorOpen: boolean;
+  setTitlePageEditorOpen: (open: boolean) => void;
+  moresContdsOpen: boolean;
+  setMoresContdsOpen: (open: boolean) => void;
+  footnoteDialogOpen: boolean;
+  setFootnoteDialogOpen: (open: boolean) => void;
+  fontsDialogOpen: boolean;
+  setFontsDialogOpen: (open: boolean) => void;
+  headerFooterOpen: boolean;
+  setHeaderFooterOpen: (open: boolean) => void;
+  // Registered by ScreenplayEditor; the menu/toolbar calls it to start image insertion.
+  imageInsertHandler: (() => void) | null;
+  setImageInsertHandler: (fn: (() => void) | null) => void;
+  openFileOpen: boolean;
+  setOpenFileOpen: (open: boolean) => void;
+  saveAsOpen: boolean;
+  setSaveAsOpen: (open: boolean) => void;
+  /** Set by ProjectView before navigating away to the editor for a new
+   *  in-project script. MenuBar's mount effect consumes the flag and prompts
+   *  the user for a script format (without wiping the project context that
+   *  ProjectView just established). */
+  pendingFormatPromptInProject: boolean;
+  /**
+   * A file in another application's format was just opened in place, and the
+   * writer has not yet been told what saving back to it can carry. Lives here
+   * rather than in MenuBar because a file can be opened from the menu *or* by
+   * the operating system handing one over, and both deserve the explanation.
+   */
+  foreignFormatNotice: { name: string; extension: string } | null;
+  setForeignFormatNotice: (v: { name: string; extension: string } | null) => void;
+  setPendingFormatPromptInProject: (v: boolean) => void;
+  /** Optional callback to run after save-as completes (e.g. deferred import). */
+  postSaveAction: (() => void) | null;
+  setPostSaveAction: (action: (() => void) | null) => void;
+  /** If the current unsaved document was imported from an external file
+   *  (.fdx, .fountain, .docx, etc.), tracks the source filename. Used by
+   *  SaveAsDialog to clarify that saves go to DraftCraft's library rather than
+   *  writing back to the source file. Cleared on successful save. */
+  importedSource: { name: string; format: string } | null;
+  setImportedSource: (src: { name: string; format: string } | null) => void;
+  /**
+   * The external file this document was opened from *in place* — a file on disk.
+   *
+   * Distinct from {@link importedSource}, which records where an imported
+   * *copy* came from and never gets written back to. When this is set, Save
+   * writes over the original file rather than exporting a new one.
+   *
+   * `bookmark` is an opaque security-scoped bookmark, not a path.
+   */
+  documentOrigin: DocumentOrigin | null;
+  setDocumentOrigin: (origin: DocumentOrigin | null) => void;
+}
+
+export interface DocumentOrigin {
+  /** Opaque security-scoped bookmark identifying the file. */
+  bookmark: string;
+  /** File name, shown in the status bar and used to pick the exporter. */
+  name: string;
+  /** Lowercase extension: the format to write back in. */
+  format: string;
+}
+
+const BEAT_UNDO_MAX = 50;
+const BEAT_SNAPSHOT_DEBOUNCE = 300; // ms — group rapid changes into one undo step
+
+/** Push current beat state onto the undo stack (debounced unless forced). */
+function _pushBeatSnapshot(get: () => EditorState, force = false) {
+  const s = get() as EditorState & { _beatIsUndoing: boolean; _beatUndoStack: unknown[]; _beatSnapshotTime: number };
+  if (s._beatIsUndoing) {
+    useEditorStore.setState({ _beatIsUndoing: false } as any);
+    return;
+  }
+  const now = Date.now();
+  if (!force && now - s._beatSnapshotTime < BEAT_SNAPSHOT_DEBOUNCE) return;
+  const stack = [...(s._beatUndoStack as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[]), { beats: s.beats, beatColumns: s.beatColumns }];
+  if (stack.length > BEAT_UNDO_MAX) stack.shift();
+  useEditorStore.setState({ _beatUndoStack: stack, _beatRedoStack: [], _beatSnapshotTime: now, canBeatUndo: true, canBeatRedo: false } as any);
+}
+
+export const useEditorStore = create<EditorState>((set, get) => ({
+  activeElement: 'action',
+  setActiveElement: (el) => set({ activeElement: el }),
+
+  documentTitle: 'Untitled Screenplay',
+  setDocumentTitle: (title) => {
+    set({ documentTitle: title });
+    // Update native window title on desktop so macOS Window menu shows file names
+    import('../services/platform').then(({ isDesktopTauri }) => {
+      if (!isDesktopTauri()) return;
+      import('@tauri-apps/api/core').then(({ invoke }) => {
+        invoke('set_window_title', { title: title || '' }).catch(() => {});
+      }).catch(() => {});
+    });
+  },
+  pageCount: 1,
+  setPageCount: (count) => set({ pageCount: count }),
+  currentPage: 1,
+  setCurrentPage: (page) => set({ currentPage: page }),
+
+  includeTitlePageInOutput: _vs.includeTitlePageInOutput !== false,
+  toggleIncludeTitlePageInOutput: () => set((s) => {
+    const v = !s.includeTitlePageInOutput;
+    saveViewState({ includeTitlePageInOutput: v });
+    return { includeTitlePageInOutput: v };
+  }),
+
+  scenes: [],
+  setScenes: (scenes) => set({ scenes }),
+  navigatorOpen: _vs.navigatorOpen ?? (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0 ? false : true),
+  toggleNavigator: () => set((s) => {
+    const v = !s.navigatorOpen;
+    saveViewState({ navigatorOpen: v });
+    return { navigatorOpen: v };
+  }),
+
+  indexCardsOpen: _vs.indexCardsOpen ?? false,
+  toggleIndexCards: () => set((s) => {
+    const v = !s.indexCardsOpen;
+    saveViewState({ indexCardsOpen: v });
+    return { indexCardsOpen: v };
+  }),
+  beatBoardOpen: _vs.beatBoardOpen ?? false,
+  toggleBeatBoard: () => set((s) => {
+    const v = !s.beatBoardOpen;
+    saveViewState({ beatBoardOpen: v });
+    return { beatBoardOpen: v };
+  }),
+  statisticsOpen: false,
+  setStatisticsOpen: (open) => set({ statisticsOpen: open }),
+  statisticsScrollTo: null,
+  setStatisticsScrollTo: (id) => set({ statisticsScrollTo: id }),
+  scriptNotesOpen: _vs.scriptNotesOpen ?? false,
+  toggleScriptNotes: () => set((s) => {
+    const v = !s.scriptNotesOpen;
+    saveViewState({ scriptNotesOpen: v });
+    return { scriptNotesOpen: v };
+  }),
+  notesActiveTab: _vs.notesActiveTab ?? 'general',
+  setNotesActiveTab: (tab) => {
+    saveViewState({ notesActiveTab: tab });
+    set({ notesActiveTab: tab });
+  },
+  notesVisible: _vs.notesVisible ?? false,
+  setNotesVisible: (v) => {
+    saveViewState({ notesVisible: v });
+    set({ notesVisible: v });
+  },
+
+  updateSceneSynopsis: (id, synopsis) =>
+    set((s) => ({
+      scenes: s.scenes.map((sc) => (sc.id === id ? { ...sc, synopsis } : sc)),
+    })),
+
+  updateSceneColor: (id, color) =>
+    set((s) => ({
+      scenes: s.scenes.map((sc) => (sc.id === id ? { ...sc, color } : sc)),
+    })),
+
+  // Notes
+  notes: [],
+  setNotes: (notes) => set({ notes }),
+  addNote: (note) => {
+    const id = uuid();
+    set((s) => ({
+      notes: [
+        ...s.notes,
+        {
+          ...note,
+          id,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    }));
+    return id;
+  },
+  updateNote: (id, updates) =>
+    set((s) => ({
+      notes: s.notes.map((n) => (n.id === id ? { ...n, ...updates } : n)),
+    })),
+  deleteNote: (id) =>
+    set((s) => ({ notes: s.notes.filter((n) => n.id !== id) })),
+  noteFilter: { elementType: null, contextLabel: null, color: null, noteId: null },
+  setNoteFilter: (filter) => set({ noteFilter: filter }),
+
+  // General notes
+  generalNotes: [],
+  setGeneralNotes: (generalNotes) => set({ generalNotes }),
+  addGeneralNote: (note) => {
+    const id = uuid();
+    set((s) => ({
+      generalNotes: [
+        ...s.generalNotes,
+        { ...note, id, createdAt: new Date().toISOString() },
+      ],
+    }));
+    return id;
+  },
+  updateGeneralNote: (id, updates) =>
+    set((s) => ({
+      generalNotes: s.generalNotes.map((n) => (n.id === id ? { ...n, ...updates } : n)),
+    })),
+  deleteGeneralNote: (id) =>
+    set((s) => ({ generalNotes: s.generalNotes.filter((n) => n.id !== id) })),
+
+  // Beats — undo/redo internals (not serialized)
+  _beatUndoStack: [] as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[],
+  _beatRedoStack: [] as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[],
+  _beatSnapshotTime: 0,
+  _beatIsUndoing: false,
+  canBeatUndo: false,
+  canBeatRedo: false,
+  beatUndo: () =>
+    set((s) => {
+      const stack = s._beatUndoStack as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[];
+      if (stack.length === 0) return {};
+      const prev = stack[stack.length - 1];
+      const redo = [...(s._beatRedoStack as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[]), { beats: s.beats, beatColumns: s.beatColumns }];
+      return {
+        beats: prev.beats,
+        beatColumns: prev.beatColumns,
+        _beatUndoStack: stack.slice(0, -1),
+        _beatRedoStack: redo,
+        _beatIsUndoing: true,
+        canBeatUndo: stack.length > 1,
+        canBeatRedo: true,
+      };
+    }),
+  beatRedo: () =>
+    set((s) => {
+      const stack = s._beatRedoStack as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[];
+      if (stack.length === 0) return {};
+      const next = stack[stack.length - 1];
+      const undo = [...(s._beatUndoStack as { beats: BeatInfo[]; beatColumns: BeatColumn[] }[]), { beats: s.beats, beatColumns: s.beatColumns }];
+      return {
+        beats: next.beats,
+        beatColumns: next.beatColumns,
+        _beatUndoStack: undo,
+        _beatRedoStack: stack.slice(0, -1),
+        _beatIsUndoing: true,
+        canBeatUndo: true,
+        canBeatRedo: stack.length > 1,
+      };
+    }),
+
+  // Beats
+  beatArrangeMode: 'auto',
+  setBeatArrangeMode: (mode) => set({ beatArrangeMode: mode }),
+  beatColumns: [],
+  setBeatColumns: (columns) => set({ beatColumns: columns }),
+  addBeatColumn: (title) => {
+    const id = uuid();
+    _pushBeatSnapshot(get);
+    set((s) => {
+      const maxPos = s.beatColumns.length > 0 ? Math.max(...s.beatColumns.map((c) => c.position)) : -1;
+      return { beatColumns: [...s.beatColumns, { id, title, position: maxPos + 1, width: 0 }] };
+    });
+    return id;
+  },
+  updateBeatColumn: (id, updates) => {
+    _pushBeatSnapshot(get);
+    set((s) => ({
+      beatColumns: s.beatColumns.map((c) => (c.id === id ? { ...c, ...updates } : c)),
+    }));
+  },
+  deleteBeatColumn: (id) => {
+    _pushBeatSnapshot(get, true);
+    set((s) => ({
+      beatColumns: s.beatColumns.filter((c) => c.id !== id),
+      beats: s.beats.filter((b) => b.columnId !== id),
+    }));
+  },
+  beats: [],
+  setBeats: (beats) => {
+    _pushBeatSnapshot(get);
+    set({ beats });
+  },
+  addBeat: (title, columnId) => {
+    _pushBeatSnapshot(get, true);
+    set((s) => {
+      const colBeats = s.beats.filter((b) => b.columnId === columnId);
+      const maxPos = colBeats.length > 0 ? Math.max(...colBeats.map((b) => b.position)) : -1;
+      return {
+        beats: [
+          ...s.beats,
+          {
+            id: uuid(),
+            title,
+            description: '',
+            columnId,
+            position: maxPos + 1,
+            color: '',
+            imageUrl: '',
+            cardWidth: 0,
+            cardHeight: 0,
+            x: 0,
+            y: 0,
+            imageHeight: 0,
+          },
+        ],
+      };
+    });
+  },
+  updateBeat: (id, updates) => {
+    _pushBeatSnapshot(get);
+    set((s) => ({
+      beats: s.beats.map((b) => (b.id === id ? { ...b, ...updates } : b)),
+    }));
+  },
+  deleteBeat: (id) => {
+    _pushBeatSnapshot(get, true);
+    set((s) => ({ beats: s.beats.filter((b) => b.id !== id) }));
+  },
+
+  // Scene numbering
+  sceneNumbersVisible: false,
+  setSceneNumbersVisible: (v) => set({ sceneNumbersVisible: v }),
+  sceneNumbersLocked: false,
+  setSceneNumbersLocked: (v) => set({ sceneNumbersLocked: v }),
+  fdxRaw: null,
+  setFdxRaw: (v) => set({ fdxRaw: v }),
+
+  sceneHeadingSpaceBefore: null,
+  setSceneHeadingSpaceBefore: (v) => set({ sceneHeadingSpaceBefore: v }),
+
+  revisionMode: false,
+  revisionColor: DEFAULT_REVISION_COLOR,
+  revisionHistory: [],
+  showRevisionColors: false,
+  setRevisionMode: (on) => set((st) => ({
+    revisionMode: on,
+    revisionHistory: on ? withRevisionColor(st.revisionHistory, st.revisionColor) : st.revisionHistory,
+  })),
+  setRevisionColor: (color) => set((st) => ({
+    revisionColor: color,
+    revisionHistory: st.revisionMode ? withRevisionColor(st.revisionHistory, color) : st.revisionHistory,
+  })),
+  advanceRevisionColor: () => set((st) => {
+    const color = nextRevisionColor(st.revisionColor);
+    return { revisionMode: true, revisionColor: color, revisionHistory: withRevisionColor(st.revisionHistory, color) };
+  }),
+  setRevisionHistory: (h) => set({ revisionHistory: h }),
+  setShowRevisionColors: (on) => set({ showRevisionColors: on }),
+  revisionSettings: DEFAULT_REVISION_SETTINGS,
+  setRevisionSettings: (patch) => set((st) => ({ revisionSettings: { ...st.revisionSettings, ...patch } })),
+  scriptProfile: DEFAULT_SCRIPT_PROFILE,
+  // Normalized on the way in, so a hand-edited or peer-written value can never
+  // put a pacing this build does not know, or a duplicate genre, in the store.
+  setScriptProfile: (profile) => set((st) => ({
+    scriptProfile: normalizeScriptProfile({ ...st.scriptProfile, ...profile }),
+  })),
+  scriptProfileOpen: false,
+  setScriptProfileOpen: (open) => set({ scriptProfileOpen: open }),
+  pageLabels: null,
+  setPageLabels: (labels) => set((st) => (
+    st.pageLabels === labels || (st.pageLabels && labels && st.pageLabels.join('\u0000') === labels.join('\u0000'))
+      ? st
+      : { pageLabels: labels }
+  )),
+  resetRevisionState: () => set({
+    revisionMode: false,
+    revisionColor: DEFAULT_REVISION_COLOR,
+    revisionHistory: [],
+    showRevisionColors: false,
+    revisionSettings: DEFAULT_REVISION_SETTINGS,
+  }),
+
+  characters: [],
+  setCharacters: (names) => set({ characters: names }),
+  addCharacter: (name) =>
+    set((s) => ({
+      characters: s.characters.includes(name.toUpperCase())
+        ? s.characters
+        : [...s.characters, name.toUpperCase()],
+    })),
+  characterProfiles: [],
+  setCharacterProfiles: (profiles) => set({ characterProfiles: profiles }),
+  upsertCharacterProfile: (name, updates) =>
+    set((s) => {
+      const upper = name.toUpperCase();
+      const idx = s.characterProfiles.findIndex((p) => p.name === upper);
+      if (idx >= 0) {
+        const copy = [...s.characterProfiles];
+        copy[idx] = { ...copy[idx], ...updates };
+        return { characterProfiles: copy };
+      }
+      return {
+        characterProfiles: [
+          ...s.characterProfiles,
+          {
+            name: upper,
+            description: '',
+            color: '',
+            highlighted: false,
+            gender: '',
+            age: '',
+            role: '',
+            backstory: '',
+            arc: '',
+            speechPattern: '',
+            vocabulary: '',
+            verbalTics: '',
+            sampleDialogue: '',
+            images: [],
+            ...updates,
+          },
+        ],
+      };
+    }),
+  deleteCharacterProfile: (name) =>
+    set((s) => ({
+      characterProfiles: s.characterProfiles.filter((p) => p.name !== name.toUpperCase()),
+    })),
+  characterRelationships: [],
+  setCharacterRelationships: (rels) => set({ characterRelationships: rels }),
+  upsertCharacterRelationship: (rel) =>
+    set((s) => {
+      const idx = s.characterRelationships.findIndex((r) => r.id === rel.id);
+      if (idx >= 0) {
+        const copy = [...s.characterRelationships];
+        copy[idx] = { ...copy[idx], ...rel };
+        return { characterRelationships: copy };
+      }
+      return { characterRelationships: [...s.characterRelationships, rel] };
+    }),
+  deleteCharacterRelationship: (id) =>
+    set((s) => ({
+      characterRelationships: s.characterRelationships.filter((r) => r.id !== id),
+    })),
+  characterProfilesOpen: _vs.characterProfilesOpen ?? false,
+  toggleCharacterProfiles: () => set((s) => {
+    const v = !s.characterProfilesOpen;
+    saveViewState({ characterProfilesOpen: v });
+    return { characterProfilesOpen: v };
+  }),
+  selectedCharacter: null,
+  setSelectedCharacter: (name) => set({ selectedCharacter: name }),
+
+  // Production tags
+  tagCategories: [...DEFAULT_TAG_CATEGORIES],
+  setTagCategories: (cats) => set({ tagCategories: cats }),
+  addTagCategory: (name, color) => {
+    const id = uuid();
+    set((s) => ({
+      tagCategories: [...s.tagCategories, { id, name, color, isBuiltIn: false }],
+    }));
+    return id;
+  },
+  deleteTagCategory: (id) =>
+    set((s) => ({
+      tagCategories: s.tagCategories.filter((c) => c.id !== id),
+      tags: s.tags.filter((t) => t.categoryId !== id),
+    })),
+  tags: [],
+  setTags: (tags) => set({ tags }),
+  addTag: (tag) => {
+    const id = uuid();
+    set((s) => ({
+      tags: [...s.tags, { ...tag, name: tag.name || tag.text, id, createdAt: new Date().toISOString() }],
+    }));
+    return id;
+  },
+  updateTag: (id, updates) =>
+    set((s) => ({
+      tags: s.tags.map((t) => (t.id === id ? { ...t, ...updates } : t)),
+    })),
+  deleteTag: (id) =>
+    set((s) => ({ tags: s.tags.filter((t) => t.id !== id) })),
+  tagsVisible: _vs.tagsVisible ?? false,
+  setTagsVisible: (v) => {
+    saveViewState({ tagsVisible: v });
+    set({ tagsVisible: v });
+  },
+  tagsPanelOpen: _vs.tagsPanelOpen ?? false,
+  toggleTagsPanel: () => set((s) => {
+    const v = !s.tagsPanelOpen;
+    saveViewState({ tagsPanelOpen: v });
+    return { tagsPanelOpen: v };
+  }),
+  locationDatabaseOpen: _vs.locationDatabaseOpen ?? false,
+  toggleLocationDatabase: () => set((s) => {
+    const v = !s.locationDatabaseOpen;
+    saveViewState({ locationDatabaseOpen: v });
+    return { locationDatabaseOpen: v };
+  }),
+  pendingTagSelection: null,
+  setPendingTagSelection: (sel) => set({ pendingTagSelection: sel }),
+  editingTagId: null,
+  setEditingTagId: (id) => set({ editingTagId: id }),
+
+  zoomLevel: _vs.zoomLevel ?? 100,
+  setZoomLevel: (level) => { const clamped = Math.min(300, Math.max(50, level)); set({ zoomLevel: clamped }); saveViewState({ zoomLevel: clamped }); },
+  zoomPanelOpen: false,
+  setZoomPanelOpen: (open) => set({ zoomPanelOpen: open }),
+
+  fontFamily: 'Courier Final Draft',
+  setFontFamily: (font) => set({ fontFamily: font }),
+  fontSize: 12,
+  setFontSize: (size) => set({ fontSize: Math.min(24, Math.max(8, size)) }),
+
+  pageLayout: DEFAULT_PAGE_LAYOUT,
+  setPageLayout: (layout) => set({ pageLayout: layout }),
+
+  appearance: readAppearance(),
+  setAppearance: (a) => {
+    saveAppearance(a);
+    applyAppearance(a);
+    void applyNativeTheme(a);
+    set({ appearance: a, theme: themeOf(a) });
+  },
+  theme: themeOf(readAppearance()),
+  setTheme: (t) => get().setAppearance(t),
+
+  toolbarMode: (_vs.toolbarMode as 'compact' | 'comfortable' | 'hidden') ?? defaultToolbarMode(),
+  setToolbarMode: (mode) => { set({ toolbarMode: mode }); saveViewState({ toolbarMode: mode }); },
+
+  characterSortBy: (_vs.characterSortBy as 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance') ?? 'importance',
+  setCharacterSortBy: (sort) => { set({ characterSortBy: sort }); saveViewState({ characterSortBy: sort }); },
+
+  navPanelWidth: 0,
+  setNavPanelWidth: (w) => set({ navPanelWidth: w }),
+
+  // Auto spell check is an app-wide setting: on by default and remembered
+  // between sessions. Grammar check is still per-document.
+  spellCheckEnabled: loadSpellCheckEnabled(),
+  toggleSpellCheck: () => set((s) => { saveSpellCheckEnabled(!s.spellCheckEnabled); return { spellCheckEnabled: !s.spellCheckEnabled }; }),
+  setSpellCheckEnabled: (v) => { saveSpellCheckEnabled(v); set({ spellCheckEnabled: v }); },
+  spellModalOpen: false,
+  setSpellModalOpen: (open) => set({ spellModalOpen: open }),
+
+  grammarCheckEnabled: false,
+  toggleGrammarCheck: () => set((s) => ({ grammarCheckEnabled: !s.grammarCheckEnabled })),
+  setGrammarCheckEnabled: (v) => set({ grammarCheckEnabled: v }),
+  grammarModalOpen: false,
+  setGrammarModalOpen: (open) => set({ grammarModalOpen: open }),
+  grammarRulesPanelOpen: false,
+  setGrammarRulesPanelOpen: (open) => set({ grammarRulesPanelOpen: open }),
+  grammarRulesEnabled: (_vs.grammarRulesEnabled as Record<string, boolean> | undefined) ?? {},
+  setGrammarRuleEnabled: (ruleId, enabled) => set((s) => {
+    const next = { ...s.grammarRulesEnabled, [ruleId]: enabled };
+    saveViewState({ grammarRulesEnabled: next });
+    return { grammarRulesEnabled: next };
+  }),
+  spellingSettings: { ...DEFAULT_SPELLING_SETTINGS, ...(_vs.spellingSettings ?? {}) },
+  setSpellingSetting: (key, value) => set((s) => {
+    const next = { ...s.spellingSettings, [key]: value };
+    saveViewState({ spellingSettings: next });
+    return { spellingSettings: next };
+  }),
+  customDictionaries: _initialDicts,
+  createGlobalDictionary: (name) => set((s) => {
+    const trimmed = name.trim();
+    if (!trimmed || s.customDictionaries[trimmed]) return s;
+    const next = { ...s.customDictionaries, [trimmed]: [] };
+    saveCustomDictionaries(next);
+    spellChecker.setGlobalDictionaries(next);
+    return { customDictionaries: next };
+  }),
+  renameGlobalDictionary: (oldName, newName) => set((s) => {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName) return s;
+    if (!(oldName in s.customDictionaries)) return s;
+    if (trimmed in s.customDictionaries) return s;
+    const next: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(s.customDictionaries)) {
+      next[k === oldName ? trimmed : k] = v;
+    }
+    saveCustomDictionaries(next);
+    spellChecker.setGlobalDictionaries(next);
+    // If the renamed dict was enabled for the current project, swap the name.
+    const enabled = spellChecker.getEnabledGlobalDicts();
+    if (enabled.includes(oldName)) {
+      spellChecker.setEnabledGlobalDicts(enabled.map((n) => (n === oldName ? trimmed : n)));
+    }
+    return { customDictionaries: next };
+  }),
+  deleteGlobalDictionary: (name) => set((s) => {
+    if (!(name in s.customDictionaries)) return s;
+    const next = { ...s.customDictionaries };
+    delete next[name];
+    saveCustomDictionaries(next);
+    spellChecker.setGlobalDictionaries(next);
+    const enabled = spellChecker.getEnabledGlobalDicts();
+    if (enabled.includes(name)) {
+      spellChecker.setEnabledGlobalDicts(enabled.filter((n) => n !== name));
+    }
+    return { customDictionaries: next };
+  }),
+  setGlobalDictionaryWords: (name, words) => set((s) => {
+    if (!(name in s.customDictionaries)) return s;
+    const cleaned = Array.from(new Set(words.map((w) => w.trim()).filter(Boolean))).sort();
+    const next = { ...s.customDictionaries, [name]: cleaned };
+    saveCustomDictionaries(next);
+    spellChecker.setGlobalDictionaries(next);
+    return { customDictionaries: next };
+  }),
+  dictionaryLibraryOpen: false,
+  setDictionaryLibraryOpen: (open) => set({ dictionaryLibraryOpen: open }),
+
+  addTargets: _initialAddTargets,
+  setAddTargets: (targets) => set(() => {
+    // Always keep at least one target so "Add to Dictionary" has a destination.
+    const next = targets.length > 0 ? [...new Set(targets)] : [PROJECT_DICT_TARGET];
+    saveAddTargets(next);
+    spellChecker.setAddTargets(next);
+    return { addTargets: next };
+  }),
+  appendWordToGlobalDictionary: (name, word) => set((s) => {
+    if (!(name in s.customDictionaries)) return s;
+    const trimmed = word.trim();
+    if (!trimmed) return s;
+    const current = s.customDictionaries[name];
+    if (current.some((w) => w.toLowerCase() === trimmed.toLowerCase())) return s;
+    const updated = Array.from(new Set([...current, trimmed])).sort();
+    const next = { ...s.customDictionaries, [name]: updated };
+    saveCustomDictionaries(next);
+    spellChecker.setGlobalDictionaries(next);
+    return { customDictionaries: next };
+  }),
+
+  trackChangesEnabled: false,
+  trackChangesLabel: '',
+  setTrackChangesEnabled: (v) => set({ trackChangesEnabled: v }),
+  setTrackChangesLabel: (v) => set({ trackChangesLabel: v }),
+  compareVersionOpen: false,
+  setCompareVersionOpen: (v) => set({ compareVersionOpen: v }),
+
+  saveStatus: 'idle',
+  saveError: null,
+  setSaveStatus: (status, error = null) => set({ saveStatus: status, saveError: error }),
+
+  searchOpen: false,
+  setSearchOpen: (open) => set({ searchOpen: open }),
+  goToPageOpen: false,
+  setGoToPageOpen: (open) => set({ goToPageOpen: open }),
+  titlePageEditorOpen: false,
+  setTitlePageEditorOpen: (open) => set({ titlePageEditorOpen: open }),
+  moresContdsOpen: false,
+  setMoresContdsOpen: (open) => set({ moresContdsOpen: open }),
+  footnoteDialogOpen: false,
+  setFootnoteDialogOpen: (open) => set({ footnoteDialogOpen: open }),
+  fontsDialogOpen: false,
+  setFontsDialogOpen: (open) => set({ fontsDialogOpen: open }),
+  headerFooterOpen: false,
+  setHeaderFooterOpen: (open) => set({ headerFooterOpen: open }),
+  imageInsertHandler: null,
+  setImageInsertHandler: (fn) => set({ imageInsertHandler: fn }),
+  openFileOpen: false,
+  setOpenFileOpen: (open) => set({ openFileOpen: open }),
+  saveAsOpen: false,
+  setSaveAsOpen: (open) => set({ saveAsOpen: open }),
+  pendingFormatPromptInProject: false,
+  setPendingFormatPromptInProject: (v) => set({ pendingFormatPromptInProject: v }),
+  foreignFormatNotice: null,
+  setForeignFormatNotice: (v) => set({ foreignFormatNotice: v }),
+  postSaveAction: null,
+  setPostSaveAction: (action) => set({ postSaveAction: action }),
+  importedSource: null,
+  // Also drops documentOrigin. The two are mutually exclusive answers to
+  // "where did this document come from" — an in-place file, an imported copy,
+  // or a library script — and every path that swaps the open document already
+  // goes through here. Without this an origin could outlive its document and
+  // Save would write the *new* screenplay over the user's original file.
+  setImportedSource: (src) => set({ importedSource: src, documentOrigin: null }),
+
+  // Deliberately NOT persisted across launches, unlike most view state. A
+  // restored origin without the document that belongs to it would point Save
+  // at the user's real file while the editor held a blank "Untitled
+  // Screenplay" — one keystroke away from overwriting their screenplay in
+  // Dropbox with nothing. Re-opening the file from Files re-establishes it.
+  documentOrigin: null,
+  // A file just opened in place matches its file exactly, so it starts out
+  // clean. Without the reset it inherited the previous document's status, and
+  // an "unsaved" left over from that one would prompt about — or auto-save — a
+  // file nobody had touched.
+  setDocumentOrigin: (origin) =>
+    set(origin ? { documentOrigin: origin, saveStatus: 'idle', saveError: null } : { documentOrigin: null }),
+}));
+
+
+// App-wide auto spell check preference. On unless the user switched it off.
+function loadSpellCheckEnabled(): boolean {
+  try { return localStorage.getItem('draftcraft:spellCheckEnabled') !== 'false'; } catch { return true; }
+}
+function saveSpellCheckEnabled(v: boolean): void {
+  try { localStorage.setItem('draftcraft:spellCheckEnabled', v ? 'true' : 'false'); } catch { /* ignore */ }
+}

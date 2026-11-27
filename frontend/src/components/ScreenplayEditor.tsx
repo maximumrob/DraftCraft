@@ -1,0 +1,3434 @@
+import { SAMPLE_CONTENT } from './sampleScript';
+import { useVersionStore } from '../stores/versionStore';
+import React, { useEffect, useCallback, useRef, useState, useMemo } from 'react';
+import { useEditor, EditorContent, type Editor } from '@tiptap/react';
+import Document from '@tiptap/extension-document';
+import Text from '@tiptap/extension-text';
+import { ScreenplayHardBreak, HardBreakLeafText } from '../editor/extensions/ScreenplayHardBreak';
+import Bold from '@tiptap/extension-bold';
+import Italic from '@tiptap/extension-italic';
+import Underline from '@tiptap/extension-underline';
+import History from '@tiptap/extension-history';
+import Collaboration from '@tiptap/extension-collaboration';
+import CollaborationCursor from '@tiptap/extension-collaboration-cursor';
+import Dropcursor from '@tiptap/extension-dropcursor';
+import Gapcursor from '@tiptap/extension-gapcursor';
+import TextAlign from '@tiptap/extension-text-align';
+import Placeholder from '@tiptap/extension-placeholder';
+import { InkAwareColor } from '../editor/extensions/InkAwareColor';
+import { RevisionMark, RevisionTextStyle } from '../editor/extensions/RevisionMark';
+import { LockedPages } from '../editor/extensions/LockedPages';
+import { assignSceneNumbers } from '../utils/sceneNumbers';
+import FontFamily from '../editor/extensions/ScreenplayFontFamily';
+import { Extension } from '@tiptap/core';
+import * as Y from 'yjs';
+
+import {
+  SceneHeading, Action, Character, Dialogue, Parenthetical,
+  Transition, General, Shot, NewAct, EndOfAct, Lyrics,
+  Section, Note,
+  ShowEpisode, CastList, FontSize, PasteFormatting, ScriptNoteMark, TagMark,
+  FormatOverride, CustomElement, DualDialogue, DualDialogueColumn,
+  TitlePage,
+  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage, AvKeymap, AvCueDecorations,
+  StartsNewPage,
+} from '../editor/extensions';
+import { registerAvCellPicker, isInAvCell, AV_BASE_CELL_ELEMENT_IDS } from '../editor/extensions/AvBlock';
+import { avCellElementRules } from '../utils/avCellElements';
+import { isBlankBlock, previousSiblingBlock, blankLineTypeFor } from '../editor/blankLine';
+import Strike from '@tiptap/extension-strike';
+import Subscript from '@tiptap/extension-subscript';
+import Superscript from '@tiptap/extension-superscript';
+import { PastedHighlight } from '../editor/extensions/PastedHighlight';
+import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
+import { generateTemplateCss, generateTemplateColorCss, injectTemplateCss } from '../utils/templateCss';
+import { docHasAnyText } from '../utils/docText';
+import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFormatting';
+import { createPaginationPlugin, getPageMetrics, activeTemplateHints } from '../editor/pagination';
+import type { FootnotePageAssignment } from '../editor/pagination';
+import type { EndnotePage } from '../utils/footnotes';
+import { createContdCasePlugin } from '../editor/contdCase';
+import { ScreenplayImage } from '../editor/extensions/ScreenplayImage';
+import { buildImageAttrs, insertImageNode, warnIfImageDegraded } from '../utils/insertImage';
+import { demoteDataUrlsToScratch } from '../services/promoteScratchAssets';
+import { docHasInlineImageBytes } from '../utils/scratchRefs';
+import { setLiveScratchDocSource } from '../services/scratchSweep';
+
+import { useEditorStore, resolveMoresContds, resolveHeaderFooter, printedPageNumber, type SceneInfo } from '../stores/editorStore';
+import type { ElementType, HeaderFooterContent } from '../stores/editorStore';
+import HeaderFooterBand from './HeaderFooterBand';
+import HeaderFooterDialog from './HeaderFooterDialog';
+import type { BandKind } from './HeaderFooterBand';
+import MenuBar from './MenuBar';
+import Toolbar from './Toolbar';
+import SceneNavigator from './SceneNavigator';
+import IndexCards from './IndexCards';
+import BeatBoard from './BeatBoard';
+import ScriptStatistics from './ScriptStatistics';
+import ScriptNotes from './ScriptNotes';
+import CharacterProfiles from './CharacterProfiles';
+import TagsPanel from './TagsPanel';
+import { PluginPanelTabs } from './PluginPanelTabs';
+import LocationDatabase from './LocationDatabase';
+import FormatPanel from './FormatPanel';
+import StatusBar from './StatusBar';
+import SearchReplace, { createSearchPlugin } from './SearchReplace';
+import GoToPage from './GoToPage';
+import ElementPicker from './ElementPicker';
+import CharacterAutocomplete from './CharacterAutocomplete';
+import SpellCheckModal from './SpellCheckModal';
+import WritingSuggestionsModal from './WritingSuggestionsModal';
+import GrammarRulesPanel from './GrammarRulesPanel';
+// MobileAccessoryBar removed — context menu via 3-finger touch only
+import ScriptContextMenu from './ScriptContextMenu';
+import { useFootnotePlan } from '../hooks/useFootnotePlan';
+import { footnotePlanSignature, type FootnotePlan } from '../utils/footnotes';
+import { createFootnoteMarkerPlugin } from '../editor/footnoteMarkers';
+import { stripNoteBackgrounds } from '../editor/stripNoteBackgrounds';
+import { sweepStrayNoteHighlights } from '../editor/scriptNoteMarks';
+import FootnoteBlock from './FootnoteBlock';
+import FootnoteDialog from './FootnoteDialog';
+import EndnotePages from './EndnotePages';
+
+/** Shared empty list, so "nothing prints" never re-renders the overlays. */
+const NO_FOOTNOTE_PAGES: FootnotePageAssignment[] = [];
+const NO_ENDNOTE_PAGES: EndnotePage[] = [];
+import { ELEMENT_MENU_EVENT } from '../utils/elementMenu';
+import { matchesShortcut } from '../utils/shortcuts';
+import { SpellCheck, spellCheckPluginKey } from '../editor/extensions/SpellCheck';
+import { Grammar, grammarPluginKey } from '../editor/extensions/Grammar';
+import { spellChecker } from '../editor/spellchecker';
+import { buildSaveContent as buildSaveContentShared, stripSaveMetadata } from '../utils/saveContent';
+import { hydrateEditorStoresFromContent } from '../utils/hydrateStores';
+import { FdxFidelity } from '../editor/extensions/FdxFidelity';
+import { FdxAdornment } from '../editor/extensions/FdxAdornment';
+import { characterKey } from '../utils/nodeText';
+import { computeContdChanges, type ContdBlock } from '../editor/contdAuto';
+import { useBackupScheduler } from '../hooks/useBackupScheduler';
+import { useRecoverySnapshot } from '../hooks/useRecoverySnapshot';
+import { useOpenDocumentGuard } from '../hooks/useOpenDocumentGuard';
+/** Formats Save can write back, so a file opened from the OS can stay attached. */
+const IN_PLACE_ORIGIN_EXTENSIONS = ['dcraft', 'fdx', 'fountain', 'fadein', 'osf', 'txt'];
+import RecoveryPromptDialog from './RecoveryPromptDialog';
+import SceneSpacingPromptDialog from './SceneSpacingPromptDialog';
+import DocumentOpenElsewhereDialog from './DocumentOpenElsewhereDialog';
+import { hasRecoverableSnapshot, type RecoverySnapshot } from '../services/recoveryService';
+import { useBackupStatusStore } from '../stores/backupStatusStore';
+import { runRetext, RETEXT_CATEGORIES, type RetextCategory } from '../editor/grammar/retextProvider';
+import { runHarper } from '../editor/grammar/harperProvider';
+import { clearEditorHistory, hasEditsSinceLoad } from '../editor/clearHistory';
+import { confirmBeforeReplacing } from '../services/pendingSave';
+import { showToast } from './Toast';
+import VersionHistory from './VersionHistory';
+import AssetManager from './AssetManager';
+import { useNavigate } from 'react-router-dom';
+import WelcomeDialog, { type WelcomeChoice } from './WelcomeDialog';
+import { downloadDCraft } from '../utils/dcraftFormat';
+import { pasteAsFountain } from '../utils/pasteFountain';
+import {
+  parseScreenplayImport,
+  extensionOf,
+  isBinaryImportExtension,
+  isImportableExtension,
+  SCREENPLAY_IMPORT_EXTENSIONS,
+  SCREENPLAY_IMPORT_FILTERS,
+  BINARY_IMPORT_EXTENSIONS,
+} from '../utils/importScreenplay';
+import { stashSessionDoc, takeSessionDoc } from '../utils/sessionDoc';
+import TitlePageEditor from './TitlePageEditor';
+import MoresContdsDialog from './MoresContdsDialog';
+import FontsDialog from './FontsDialog';
+import { fontStack } from '../utils/fonts';
+import { titlePageRuleId, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
+import CompareVersionPicker from './CompareVersionPicker';
+import ZoomPanel from './ZoomPanel';
+import { useIsTouchDevice, useSwipeEdge, usePinchZoom } from '../hooks/useTouch';
+import { useSettingsStore } from '../stores/settingsStore';
+import { startCollabSync, stopCollabSync } from '../services/collabSync';
+import { LiveProvider } from '../services/liveProvider';
+import LiveSessionDialog from './LiveSessionDialog';
+import { prosemirrorJSONToYXmlFragment } from 'y-prosemirror';
+import type { JSONContent as LiveJSONContent } from '@tiptap/core';
+import { isDesktopTauri } from '../services/platform';
+import { pluginRegistry } from '../plugins/registry';
+import { createTrackChangesPlugin, trackChangesPluginKey } from '../editor/trackChanges';
+import { readStoredVersion } from '../services/scriptVersions';
+import type { VersionSummary } from '../services/scriptVersions';
+
+// Vibrant dark colors for collaboration cursors and avatars
+const COLLAB_COLORS = [
+  '#7C3AED', '#DC2626', '#D97706', '#059669', '#2563EB',
+  '#DB2777', '#7C2D12', '#4338CA', '#0E7490', '#9333EA',
+];
+function randomCollabColor() {
+  return COLLAB_COLORS[Math.floor(Math.random() * COLLAB_COLORS.length)];
+}
+// Live sessions have exactly two roles, so each gets its own fixed colour
+// (two random picks could land on the same one).
+const LIVE_HOST_COLOR = '#DC2626';
+const LIVE_GUEST_COLOR = '#2563EB';
+
+// Default next element type when pressing Enter
+const DEFAULT_NEXT_TYPE: Record<string, string> = {
+  sceneHeading: 'action',
+  action: 'action',
+  character: 'dialogue',
+  dialogue: 'dialogue',
+  parenthetical: 'dialogue',
+  transition: 'sceneHeading',
+  general: 'general',
+  shot: 'action',
+  newAct: 'sceneHeading',
+  endOfAct: 'newAct',
+  lyrics: 'lyrics',
+  showEpisode: 'action',
+  castList: 'castList',
+};
+
+const ALL_ELEMENT_TYPES: ElementType[] = [
+  'sceneHeading', 'action', 'character', 'dialogue', 'parenthetical',
+  'transition', 'general', 'shot', 'newAct', 'endOfAct', 'lyrics',
+  'showEpisode', 'castList', 'section', 'note',
+];
+
+/**
+ * Which element the caret is standing on, or null when nothing answers.
+ *
+ * Shared by `onSelectionUpdate` and every path that replaces the document
+ * wholesale. Tiptap raises `selectionUpdate` only when the mapped selection
+ * differs from the old one, so swapping in a whole new document can leave the
+ * store reporting the element the *previous* document's caret was on — and
+ * every control derived from it reading the wrong script: the toolbar's element
+ * list, the AV row buttons, the language selector.
+ *
+ * Order matters. Custom elements and title-page fields are one node type with
+ * an attribute, and the four AV cell paragraph types are deliberately absent
+ * from ALL_ELEMENT_TYPES (they are not top-level screenplay elements and have
+ * to stay out of TextAlign's node list), so each needs asking about separately
+ * before the general sweep.
+ */
+function resolveActiveElement(ed: Editor): ElementType | null {
+  try {
+    if (ed.isActive('customElement')) {
+      const attrs = ed.getAttributes('customElement');
+      if (attrs?.customTypeId) return attrs.customTypeId as ElementType;
+    }
+    if (ed.isActive('titlePage')) {
+      const field = (ed.getAttributes('titlePage')?.field as string) || 'title';
+      return titlePageRuleId(field) as ElementType;
+    }
+    // Only the four AV paragraph types need asking about here — the screenplay
+    // elements a cell also accepts are in ALL_ELEMENT_TYPES below.
+    for (const type of AV_BASE_CELL_ELEMENT_IDS) {
+      if (ed.isActive(type)) return type as ElementType;
+    }
+    for (const type of ALL_ELEMENT_TYPES) {
+      if (ed.isActive(type)) return type;
+    }
+  } catch (err) {
+    console.warn('[editor] could not resolve the active element', err);
+  }
+  return null;
+}
+
+interface OverlayInfo {
+  top: number;
+  pageNumber: number;
+  isDialogueSplit: boolean;
+  characterName: string;
+  isTitlePage: boolean;
+}
+
+
+
+const ScreenplayEditor: React.FC = () => {
+  const navigate = useNavigate();
+
+  const {
+    setActiveElement, setScenes, setPageCount, setCurrentPage,
+    zoomLevel, setZoomLevel, fontFamily, fontSize, pageLayout, tagsVisible, notesVisible,
+    beatBoardOpen, statisticsOpen,
+    navigatorOpen, toggleNavigator, scriptNotesOpen, toggleScriptNotes,
+    characterProfilesOpen, tagsPanelOpen, locationDatabaseOpen,
+    spellCheckEnabled, spellModalOpen, setSpellModalOpen,
+    grammarCheckEnabled, grammarModalOpen, setGrammarModalOpen,
+    grammarRulesPanelOpen, setGrammarRulesPanelOpen,
+    setDocumentTitle,
+    sceneNumbersVisible, sceneNumbersLocked,
+    includeTitlePageInOutput,
+    showRevisionColors,
+    saveStatus, saveError, setSaveStatus,
+  } = useEditorStore();
+
+
+  // ── Collaboration state ──
+  const [collabMode, setCollabMode] = useState(false);
+  const [collabUserName, setCollabUserName] = useState('Owner');
+  const [isCollabHost, setIsCollabHost] = useState(false);
+  const [collabRole, setCollabRole] = useState<'editor' | 'viewer'>('editor');
+  const [collabUsers, setCollabUsers] = useState<{ name: string; color: string }[]>([]);
+  const [collabColor, setCollabColor] = useState(() => randomCollabColor());
+  // ── Serverless live sessions (Tools ▸ Live Co-editing) ──
+  const [liveMode, setLiveMode] = useState(false);
+  const [liveDialog, setLiveDialog] = useState<'host' | 'join' | null>(null);
+  const liveProviderRef = useRef<LiveProvider | null>(null);
+  const liveActiveRef = useRef(false);
+  const liveRestoreRef = useRef<LiveJSONContent | null>(null);
+  const endLiveRef = useRef<(message?: string) => void>(() => {});
+  const [collabConnectionState, setCollabConnectionState] = useState<'connecting' | 'connected' | 'synced' | 'disconnected'>('connecting');
+  // ── Collaboration activity log ──
+  const [collabActivityLog, setCollabActivityLog] = useState<{ time: Date; message: string }[]>([]);
+  const [collabActivityOpen, setCollabActivityOpen] = useState(false);
+  const addCollabActivity = useCallback((message: string) => {
+    setCollabActivityLog((prev) => [...prev.slice(-49), { time: new Date(), message }]);
+  }, []);
+
+  // ── Panel resize state ──
+  const [navWidth, setNavWidth] = useState(240);
+  const [rightPanelWidth, setRightPanelWidth] = useState(300);
+
+  // Sync nav width to store for floating menu positioning
+  useEffect(() => {
+    useEditorStore.getState().setNavPanelWidth(navigatorOpen ? navWidth : 0);
+  }, [navWidth, navigatorOpen]);
+  const resizingRef = useRef<'left' | 'right' | null>(null);
+  const resizeStartXRef = useRef(0);
+  const resizeStartWidthRef = useRef(0);
+
+  const handleResizePointerDown = useCallback((side: 'left' | 'right', e: React.PointerEvent) => {
+    e.preventDefault();
+    resizingRef.current = side;
+    resizeStartXRef.current = e.clientX;
+    resizeStartWidthRef.current = side === 'left' ? navWidth : rightPanelWidth;
+
+    const handlePointerMove = (ev: PointerEvent) => {
+      const delta = ev.clientX - resizeStartXRef.current;
+      if (resizingRef.current === 'left') {
+        setNavWidth(Math.max(160, Math.min(500, resizeStartWidthRef.current + delta)));
+      } else {
+        setRightPanelWidth(Math.max(200, Math.min(600, resizeStartWidthRef.current - delta)));
+      }
+    };
+
+    const handlePointerUp = () => {
+      resizingRef.current = null;
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, [navWidth, rightPanelWidth]);
+
+  const rightPanelVisible = scriptNotesOpen || characterProfilesOpen || tagsPanelOpen || locationDatabaseOpen;
+
+  // Yjs document & provider — stable across renders while collab is active
+  const ydocRef = useRef<Y.Doc | null>(null);
+  // Editor ref for onSynced callback to seed content when Yjs doc is empty
+  const collabEditorRef = useRef<ReturnType<typeof useEditor>>(null);
+
+  // Cleanup collab provider
+  const destroyCollab = useCallback(() => {
+    stopCollabSync();
+    if (liveProviderRef.current) {
+      void liveProviderRef.current.close();
+      liveProviderRef.current = null;
+    }
+    if (ydocRef.current) {
+      ydocRef.current.destroy();
+      ydocRef.current = null;
+    }
+    setCollabUsers([]);
+  }, []);
+
+  // ── Serverless live sessions ──────────────────────────────────────────
+  // The dialog makes the connection first (host: the script is already in the
+  // shared document; guest: the script has arrived). Only then does the editor
+  // switch to collaboration mode, so neither editor ever seeds the document.
+  const endLive = useCallback((message?: string) => {
+    const wasActive = liveActiveRef.current;
+    const ed = collabEditorRef.current;
+    // Whoever leaves keeps a copy of the script as it stands.
+    liveRestoreRef.current = wasActive && ed && !ed.isDestroyed ? ed.getJSON() : null;
+    liveActiveRef.current = false;
+    destroyCollab();
+    setLiveDialog(null);
+    if (wasActive) {
+      setCollabMode(false);
+      setLiveMode(false);
+      setIsCollabHost(false);
+      setCollabRole('editor');
+      setEditorKey((k) => k + 1);
+    }
+    if (message) showToast(message, 'info');
+  }, [destroyCollab]);
+  endLiveRef.current = endLive;
+
+  const handleStopLive = useCallback(() => {
+    endLive('Live session ended');
+  }, [endLive]);
+
+  const beginLive = useCallback((role: 'host' | 'join', name: string): LiveProvider => {
+    destroyCollab(); // clears any earlier, abandoned attempt
+    const isHost = role === 'host';
+    const ydoc = new Y.Doc();
+    if (isHost) {
+      const ed = collabEditorRef.current;
+      if (!ed || ed.isDestroyed) throw new Error('The editor is not ready yet.');
+      // The host's script goes into the shared document up front.
+      prosemirrorJSONToYXmlFragment(ed.schema, ed.getJSON(), ydoc.getXmlFragment('default'));
+    }
+    const provider = new LiveProvider(ydoc, {
+      onStatus: (s) => setCollabConnectionState(s),
+      onPeers: (users) => {
+        setCollabUsers((prev) => {
+          const before = new Set(prev.map((u) => u.name));
+          const now = new Set(users.map((u) => u.name));
+          for (const u of users) if (!before.has(u.name)) addCollabActivity(`${u.name} joined the session`);
+          for (const u of prev) if (!now.has(u.name)) addCollabActivity(`${u.name} left the session`);
+          return users;
+        });
+      },
+      onClosed: (reason) => endLiveRef.current(reason),
+    });
+    ydocRef.current = ydoc;
+    liveProviderRef.current = provider;
+    setCollabUserName(name);
+    setCollabColor(isHost ? LIVE_HOST_COLOR : LIVE_GUEST_COLOR);
+    setCollabConnectionState('connecting');
+    setCollabActivityLog([]);
+    addCollabActivity('Starting live session');
+    // Host: puts notes, tags, beats etc. into the shared document now.
+    // Guest: picks them up as soon as they arrive.
+    startCollabSync(ydoc, isHost);
+    return provider;
+  }, [destroyCollab, addCollabActivity]);
+
+  const finishLive = useCallback((role: 'host' | 'join') => {
+    if (role === 'join') {
+      // The guest's editor now shows the host's script. Cut every link to
+      // whatever was open before, so nothing can save over it.
+      useEditorStore.getState().setDocumentOrigin(null);
+      useEditorStore.getState().setImportedSource(null);
+      setDocumentTitle('Untitled Screenplay');
+    }
+    liveActiveRef.current = true;
+    setIsCollabHost(role === 'host');
+    setCollabRole('editor');
+    setLiveMode(true);
+    setCollabMode(true);
+    setEditorKey((k) => k + 1);
+    setLiveDialog(null);
+    addCollabActivity(role === 'host' ? 'Your partner connected' : 'Connected to the host');
+  }, [addCollabActivity, setDocumentTitle]);
+
+  // Force editor recreation when collab mode toggles
+  const [editorKey, setEditorKey] = useState(0);
+
+  const editorMainRef = useRef<HTMLDivElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const setPageCountRef = useRef(setPageCount);
+  setPageCountRef.current = setPageCount;
+  const pageLayoutRef = useRef(pageLayout);
+  pageLayoutRef.current = pageLayout;
+
+  // ── Touch gestures (must be after editorMainRef) ──
+  const isTouch = useIsTouchDevice();
+  useSwipeEdge({
+    edge: 'left',
+    onSwipe: toggleNavigator,
+    enabled: isTouch && !navigatorOpen && typeof window !== 'undefined' && window.innerWidth <= 1100,
+  });
+  useSwipeEdge({
+    edge: 'right',
+    onSwipe: toggleScriptNotes,
+    enabled: isTouch && !rightPanelVisible,
+  });
+  usePinchZoom(editorMainRef, {
+    currentZoom: zoomLevel,
+    onZoomChange: setZoomLevel,
+    enabled: isTouch && !beatBoardOpen,
+  });
+
+  // 3-finger touch opens context menu on touch devices
+  useEffect(() => {
+    if (!isTouch) return;
+    const handleThreeFingerTouch = (e: TouchEvent) => {
+      if (e.touches.length === 3) {
+        e.preventDefault();
+        // Use center of the three touches as position
+        let cx = 0, cy = 0;
+        for (let i = 0; i < 3; i++) {
+          cx += e.touches[i].clientX;
+          cy += e.touches[i].clientY;
+        }
+        cx /= 3;
+        cy /= 3;
+        setCtxMenuState({ visible: true, position: { x: cx, y: cy }, spellInfo: null, grammarInfo: null });
+      }
+    };
+    document.addEventListener('touchstart', handleThreeFingerTouch, { passive: false });
+    return () => document.removeEventListener('touchstart', handleThreeFingerTouch);
+  }, [isTouch]);
+
+  const zoomLevelRef = useRef(zoomLevel);
+  // Preserve scroll position when zoom changes: content scales but scrollTop
+  // is in viewport pixels, so without an adjustment the user lands on a
+  // completely different page after each zoom step.
+  const prevZoomRef = useRef(zoomLevel);
+  useEffect(() => {
+    const el = editorMainRef.current;
+    if (!el) {
+      prevZoomRef.current = zoomLevel;
+      return;
+    }
+    const oldScale = (prevZoomRef.current || 100) / 100;
+    const newScale = (zoomLevel || 100) / 100;
+    if (oldScale !== newScale && el.scrollTop > 0) {
+      el.scrollTop = el.scrollTop * (newScale / oldScale);
+    }
+    prevZoomRef.current = zoomLevel;
+  }, [zoomLevel]);
+  zoomLevelRef.current = zoomLevel;
+
+  const [overlays, setOverlays] = useState<OverlayInfo[]>([]);
+
+  const {
+    titlePageEditorOpen, setTitlePageEditorOpen,
+    moresContdsOpen, setMoresContdsOpen,
+    footnoteDialogOpen, setFootnoteDialogOpen,
+    fontsDialogOpen, setFontsDialogOpen,
+    compareVersionOpen, setCompareVersionOpen,
+    setTrackChangesEnabled, setTrackChangesLabel,
+  } = useEditorStore();
+
+  // Auto-fit page to viewport on mobile/tablet
+  const autoZoomApplied = useRef(false);
+  useEffect(() => {
+    const handleAutoZoom = () => {
+      if (window.innerWidth <= 768 && editorMainRef.current) {
+        const containerWidth = editorMainRef.current.clientWidth - 16; // small padding
+        const pageWidthPx = pageLayout.pageWidth * 96; // 1in = 96px
+        const fitZoom = Math.floor((containerWidth / pageWidthPx) * 100);
+        setZoomLevel(Math.max(50, Math.min(100, fitZoom)));
+        autoZoomApplied.current = true;
+      } else if (autoZoomApplied.current && window.innerWidth > 768) {
+        setZoomLevel(100);
+        autoZoomApplied.current = false;
+      }
+    };
+    // Delay initial call to ensure editorMainRef is measured
+    const timer = setTimeout(handleAutoZoom, 100);
+    window.addEventListener('resize', handleAutoZoom);
+    window.addEventListener('orientationchange', handleAutoZoom);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('resize', handleAutoZoom);
+      window.removeEventListener('orientationchange', handleAutoZoom);
+    };
+  }, [pageLayout.pageWidth, setZoomLevel]);
+
+  const collabInitialContent = useRef<Record<string, unknown> | null>(null);
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => { destroyCollab(); };
+  }, [destroyCollab]);
+
+  // Welcome dialog: shown on every launch unless the writer has hidden it
+  // (the checkbox on the dialog, and the matching switch in Settings).
+  const [showWelcome, setShowWelcome] = useState(() => !useSettingsStore.getState().hideWelcome);
+
+  // ── Drag-and-drop file import state ──
+  const [dragOverEditor, setDragOverEditor] = useState(false);
+
+  // Element picker state. `availableTypes`, when set, restricts the picker to
+  // that exact list — used inside AV cells, where the list is whatever the
+  // active template allows in that column (utils/avCellElements.ts).
+  const [pickerState, setPickerState] = useState<{
+    visible: boolean;
+    position: { top: number; left: number };
+    defaultType: ElementType;
+    availableTypes?: ElementType[];
+    /**
+     * Whether the line the menu opened on is blank. The menu used to open only
+     * on blank lines; the shortcut and the Format menu can now open it on a
+     * line with text, where "one more blank line" is not what a writer means
+     * and the menu is a plain type chooser again.
+     */
+    blankLine: boolean;
+    /**
+     * Whether the menu opened inside an AV cell. The type list is already
+     * scoped by `availableTypes`; this additionally offers "New AV Row", which
+     * on touch is the only row control reachable from the keyboard's Return
+     * key.
+     */
+    avCell: boolean;
+  }>({ visible: false, position: { top: 0, left: 0 }, defaultType: 'action', blankLine: false, avCell: false });
+  /** Read by the shortcut handler, which must not re-open a menu already up. */
+  const pickerVisibleRef = useRef(false);
+  pickerVisibleRef.current = pickerState.visible;
+
+  const showPickerRef = useRef<(defaultType: ElementType, availableTypes?: ElementType[]) => void>(() => {});
+  /** Opens the menu wherever the caret is, from a shortcut or a menu item. */
+  const openElementMenuRef = useRef<() => void>(() => {});
+  /** Splits the current (blank) block to leave one more blank line behind. */
+  const insertBlankLineRef = useRef<(typeId?: string) => void>(() => {});
+  /**
+   * Start position of the block whose element menu was last dismissed, so the
+   * next Enter there inserts a line instead of re-opening the menu the writer
+   * just refused. Cleared as soon as the caret is anywhere else.
+   */
+  const pickerDismissedAtRef = useRef<number | null>(null);
+
+  // Character autocomplete state
+  const [knownCharacters, setKnownCharacters] = useState<string[]>([]);
+  const [charAutoState, setCharAutoState] = useState<{
+    visible: boolean;
+    position: { top: number; left: number };
+    suggestions: string[];
+    /** Offset within the block where a pick starts replacing (0 = whole block). */
+    replaceFrom?: number;
+  }>({ visible: false, position: { top: 0, left: 0 }, suggestions: [] });
+  const charAutoDismissedRef = useRef(false);
+
+  const [formatPanelOpen, setFormatPanelOpen] = useState(false);
+
+  // Script context menu state
+  const [ctxMenuState, setCtxMenuState] = useState<{
+    visible: boolean;
+    position: { x: number; y: number };
+    spellInfo: { word: string; from: number; to: number; suggestions: string[] } | null;
+    grammarInfo: { from: number; to: number; ruleId: string; message: string; severity: 'style' | 'grammar'; suggestions: string[] } | null;
+    savedSelection?: { from: number; to: number };
+  }>({ visible: false, position: { x: 0, y: 0 }, spellInfo: null, grammarInfo: null });
+
+  const breaksRef = useRef<import('../editor/pagination').BreakInfo[]>([]);
+
+  // Measure overlay positions from the actual DOM after decorations are applied
+  const measureOverlays = useCallback(() => {
+    if (!pageRef.current) return;
+    const pageEl = pageRef.current;
+    const root = pageEl.querySelector('.tiptap');
+    if (!root) return;
+
+    const pageRect = pageEl.getBoundingClientRect();
+    const m = getPageMetrics(pageLayoutRef.current);
+    // Track-change deletion widgets become DOM siblings of real document
+    // nodes, which would shift every index after them and make the page
+    // break overlay land in the wrong place.  Filter them out so
+    // children[brk.nodeIndex] matches the ProseMirror model index.
+    // Normal editing (no track changes) has no such widgets, so this is
+    // a no-op there.
+    const children = (Array.from(root.children) as HTMLElement[]).filter(
+      (el) =>
+        !el.classList.contains('track-change-deleted') &&
+        !el.classList.contains('track-change-deleted-block'),
+    );
+    const breaks = breaksRef.current;
+
+    // Mark the title-page region so Print can drop it when the writer has asked
+    // for a script without one. Marked by model index rather than by class: the
+    // region takes in the blank spacers and any images above the title, and only
+    // the titlePage nodes carry a class of their own. The title-page
+    // break is where the body starts, so its nodeIndex is the region's length.
+    const titleEnd = breaks.find((b) => b.isTitlePage)?.nodeIndex ?? 0;
+    children.forEach((el, i) => el.classList.toggle('sp-title-region', i < titleEnd));
+
+    if (breaks.length === 0) { setOverlays([]); return; }
+
+    // getBoundingClientRect returns coordinates in viewport space (affected by
+    // CSS transform: scale), but the overlay top is in the page's local
+    // (unscaled) coordinate system.  Divide by zoom to convert.
+    const scale = (zoomLevelRef.current || 100) / 100;
+    const lineHeightPx = 12 * (96 / 72); // 16px — matches pagination LINE_HEIGHT_PT
+    // Room for the CONT'D line is only reserved when the marker is actually
+    // drawn — the pagination decoration reads the same setting the same way.
+    // Subtracting it here unconditionally moved the whole break band, footer
+    // and header included, a line higher than the break it belongs to whenever
+    // a writer had turned (MORE)/(CONT'D) off.
+    const showContd = resolveMoresContds(pageLayoutRef.current).dialogueBreakContd;
+    const newOverlays: OverlayInfo[] = [];
+    for (const brk of breaks) {
+      const el = children[brk.nodeIndex];
+      if (!el) continue;
+      const elRect = el.getBoundingClientRect();
+      const contdHeight = brk.isDialogueSplit && showContd ? lineHeightPx : 0;
+      const overlayTop = (elRect.top - pageRect.top) / scale - m.sepHeightPx - contdHeight;
+      newOverlays.push({
+        top: overlayTop,
+        pageNumber: brk.pageNumber,
+        isDialogueSplit: brk.isDialogueSplit,
+        characterName: brk.characterName,
+        isTitlePage: brk.isTitlePage,
+      });
+    }
+    setOverlays(newOverlays);
+  }, []);
+
+  // Which notes print, where, and how much room they need. Null — and free —
+  // whenever nothing prints. Held in a ref as well, because the pagination and
+  // marker plugins are built once and read it lazily, exactly as they read the
+  // page layout and the template hints.
+  const footnotePlanRef = useRef<FootnotePlan | null>(null);
+
+  const [FootnoteMarkerExtension] = React.useState(() =>
+    Extension.create({
+      name: 'footnoteMarkers',
+      addProseMirrorPlugins() {
+        return [createFootnoteMarkerPlugin(() => footnotePlanRef.current)];
+      },
+    })
+  );
+
+  // Which notes each page owes at its foot. Always empty while nothing prints.
+  const [footnotePages, setFootnotePages] = useState<FootnotePageAssignment[]>(NO_FOOTNOTE_PAGES);
+  const setFootnotePagesRef = useRef(setFootnotePages);
+  setFootnotePagesRef.current = setFootnotePages;
+  const [endnotePages, setEndnotePages] = useState<EndnotePage[]>(NO_ENDNOTE_PAGES);
+  const setEndnotePagesRef = useRef(setEndnotePages);
+  setEndnotePagesRef.current = setEndnotePages;
+
+  const [PaginationExtension] = React.useState(() =>
+    Extension.create({
+      name: 'pagination',
+      addProseMirrorPlugins() {
+        return [
+          createPaginationPlugin(
+            (state) => {
+              setPageCountRef.current(state.pageCount);
+              breaksRef.current = state.breaks;
+              useEditorStore.getState().setPageLabels(state.pageLabels ?? null);
+              // Keep the identity stable when nothing prints, so the overlays
+              // do not re-render for a change that cannot have happened.
+              setFootnotePagesRef.current(state.footnotePages ?? NO_FOOTNOTE_PAGES);
+              setEndnotePagesRef.current(state.endnotePages ?? NO_ENDNOTE_PAGES);
+              // Measure from DOM after ProseMirror applies decoration margins
+              requestAnimationFrame(() => requestAnimationFrame(measureOverlays));
+            },
+            () => pageLayoutRef.current,
+            // Template-driven page rules (e.g. "every New Act starts a page").
+            () => activeTemplateHints(),
+            // Room to hold back for printing notes; null when none print.
+            () => footnotePlanRef.current,
+          ),
+        ];
+      },
+    })
+  );
+
+  const [ContdCaseExtension] = React.useState(() =>
+    Extension.create({
+      name: 'contdCase',
+      addProseMirrorPlugins() {
+        return [createContdCasePlugin(() => pageLayoutRef.current)];
+      },
+    })
+  );
+
+  // Search highlight plugin
+  const [SearchExtension] = React.useState(() =>
+    Extension.create({
+      name: 'searchHighlight',
+      addProseMirrorPlugins() {
+        return [createSearchPlugin()];
+      },
+    })
+  );
+
+  // Track changes plugin
+  const [TrackChangesExtension] = React.useState(() =>
+    Extension.create({
+      name: 'trackChanges',
+      addProseMirrorPlugins() {
+        return [createTrackChangesPlugin()];
+      },
+    })
+  );
+
+  // Block formatting shortcuts (Mod-b/i/u) when the attribute is locked by the template
+  const [EnforceGuardExtension] = React.useState(() =>
+    Extension.create({
+      name: 'enforceGuard',
+      priority: 1001,
+      addKeyboardShortcuts() {
+        const isLocked = (editor: any, attr: 'bold' | 'italic' | 'underline') => {
+          const tpl = useFormattingTemplateStore.getState().getActiveTemplate();
+          if (tpl.mode !== 'enforce') return false;
+          const rule = getCurrentElementRule(editor, tpl);
+          const locked = getLockedFormatting(rule, true);
+          return locked[attr];
+        };
+        return {
+          'Mod-b': ({ editor }) => isLocked(editor, 'bold'),
+          'Mod-i': ({ editor }) => isLocked(editor, 'italic'),
+          'Mod-u': ({ editor }) => isLocked(editor, 'underline'),
+        };
+      },
+    })
+  );
+
+  // Centralized Enter handler — overrides per-extension Enter handlers via high priority
+  const [EnterHandlerExtension] = React.useState(() =>
+    Extension.create({
+      name: 'enterHandler',
+      priority: 1000,
+      addKeyboardShortcuts() {
+        return {
+          Enter: ({ editor }) => {
+            const { $from } = editor.state.selection;
+            const currentNode = $from.parent;
+            const currentType = currentNode.type.name;
+            // A line of nothing but spaces counts as blank for the element
+            // picker — except in General, whose whole purpose is text that does
+            // not follow screenplay shape. Indentation there is content, and
+            // calling it blank meant Enter opened the picker instead of adding a
+            // line, so whatever the writer picked replaced the General type they
+            // had deliberately set, and the spacing went with it.
+            const isEmpty = currentType === 'general'
+              ? currentNode.textContent.length === 0
+              : currentNode.textContent.trim() === '';
+
+            // A non-text selection (e.g. a selected image atom) — let ProseMirror's
+            // default Enter handle it. Computing block positions below would throw
+            // "no position before the top-level node" for a top-level NodeSelection.
+            if (!$from.parent.isTextblock) return false;
+
+            // Title-page lines must STAY in the title page: Enter adds another
+            // (blank) title-page line instead of a body element, so the content
+            // shifts down one line rather than breaking to the next page.
+            if (currentType === 'titlePage') {
+              const atStartTp = $from.parentOffset === 0;
+              editor.chain().splitBlock().run();
+              const s2 = editor.state;
+              const np = s2.selection.$from;
+              if (np.depth > 0) {
+                const cursorStart = np.before(np.depth);
+                let blankPos = -1;
+                if (atStartTp) {
+                  if (cursorStart > 0) {
+                    const prev = s2.doc.resolve(cursorStart - 1);
+                    if (prev.depth > 0) blankPos = prev.before(prev.depth);
+                  }
+                } else {
+                  const n = s2.doc.nodeAt(cursorStart);
+                  if (n && n.textContent.trim() === '') blankPos = cursorStart;
+                }
+                if (blankPos >= 0) {
+                  const bn = s2.doc.nodeAt(blankPos);
+                  if (bn && bn.type.name === 'titlePage' && bn.attrs.field !== 'blank') {
+                    editor.view.dispatch(s2.tr.setNodeMarkup(blankPos, undefined, { ...bn.attrs, field: 'blank' }));
+                  }
+                }
+              }
+              return true;
+            }
+
+            // Inside dualDialogue on an empty line: exit the container
+            if (isEmpty) {
+              for (let d = $from.depth; d >= 0; d--) {
+                if ($from.node(d).type.name === 'dualDialogue') {
+                  // Delete the empty node, then insert action after dual dialogue
+                  const emptyFrom = $from.before($from.depth);
+                  const emptyTo = $from.after($from.depth);
+                  const afterDual = $from.after(d);
+                  editor.chain()
+                    .deleteRange({ from: emptyFrom, to: emptyTo })
+                    .insertContentAt(afterDual - (emptyTo - emptyFrom), { type: 'action' })
+                    .focus(afterDual - (emptyTo - emptyFrom) + 1)
+                    .run();
+                  return true;
+                }
+              }
+              // Enter opens the element menu on a blank line, which left the
+              // keystroke no way to mean "just another blank line" — and at the
+              // end of a script there is no populated line below to insert
+              // against either, so there was no workaround at all.
+              // Three conditions insert the line rather than open the menu; the
+              // menu's own Enter and its Blank Line row reach the same code.
+              const blockStart = $from.before($from.depth);
+              const menuEnabled = useSettingsStore.getState().elementMenuOnEnter;
+              //   1. the writer turned the menu off outright;
+              //   2. this blank line already follows a blank line, so the menu
+              //      offered itself on the first one and the answer was "space";
+              //   3. the menu was just dismissed on this very line — Escape has
+              //      to leave Enter meaning what it means everywhere else.
+              if (!menuEnabled
+                  || isBlankBlock(previousSiblingBlock($from))
+                  || pickerDismissedAtRef.current === blockStart) {
+                insertBlankLineRef.current();
+                return true;
+              }
+              // Normal blank line: show element picker. Pass the custom id
+              // rather than the `customElement` wrapper, so the menu can mark
+              // the row the line is already on.
+              showPickerRef.current((currentType === 'customElement'
+                ? (currentNode.attrs?.customTypeId || currentType)
+                : currentType) as ElementType);
+              return true;
+            }
+
+            // Check if cursor is at the very beginning of the block
+            const atBlockStart = $from.parentOffset === 0;
+
+            // Non-empty line: split block, then fix up both halves' types
+            // Use template rules if available, fall back to DEFAULT_NEXT_TYPE
+            const templateStore = useFormattingTemplateStore.getState();
+            const activeTemplate = templateStore.getActiveTemplate();
+            // For custom elements, use customTypeId to find the rule
+            const effectiveType = currentType === 'customElement'
+              ? (currentNode.attrs?.customTypeId || currentType)
+              : currentType;
+            const elementRule = activeTemplate.rules[effectiveType];
+            const nextType = elementRule?.nextOnEnter || DEFAULT_NEXT_TYPE[currentType] || currentType;
+            editor.chain().splitBlock().run();
+
+            // After split, cursor is in the new (second) block.
+            const { tr, schema, selection } = editor.state;
+            const pos = selection.$from;
+            const newBlockStart = pos.before(pos.depth);
+
+            if (atBlockStart) {
+              // Cursor was at position 0: user is inserting a blank line above.
+              // The second block (with content) should keep the original type.
+              // The first block (empty, above) becomes action for a clean blank
+              // line — except in General, which stays General. A blank Action
+              // above a screenplay element is the right neutral default, but in
+              // General it silently converted a line the writer had explicitly
+              // set, and the new line could no longer hold indentation.
+              const origNodeType = schema.nodes[currentType];
+              if (origNodeType && tr.doc.nodeAt(newBlockStart)?.type.name !== currentType) {
+                tr.setNodeMarkup(newBlockStart, origNodeType);
+              }
+              const prevResolved = tr.doc.resolve(newBlockStart - 1);
+              const prevBlockStart = prevResolved.before(prevResolved.depth);
+              // On a title page the blank line stays a title-page node. An
+              // Action here would sit above the title page and end the region
+              // the exporters recognise, dropping the whole title page onto the
+              // top of script page 1.
+              const blankTypeName = currentType === 'general' || currentType === 'titlePage'
+                ? currentType
+                : 'action';
+              const blankType = schema.nodes[blankTypeName];
+              if (blankTypeName === 'titlePage') {
+                // A spacer, not a second title: the split copied the title
+                // node's attrs onto both halves, structured fields and all.
+                tr.setNodeMarkup(prevBlockStart, blankType, { field: 'blank' });
+              } else if (blankType && tr.doc.nodeAt(prevBlockStart)?.type.name !== blankTypeName) {
+                tr.setNodeMarkup(prevBlockStart, blankType);
+              }
+            } else {
+              // Cursor was in the middle/end: apply normal type transition.
+              // Fix the new block's type, and ensure the first block kept original type.
+              const isNextBuiltIn = !!schema.nodes[nextType];
+              if (isNextBuiltIn) {
+                const newNodeType = schema.nodes[nextType];
+                if (newNodeType && tr.doc.nodeAt(newBlockStart)?.type.name !== nextType) {
+                  tr.setNodeMarkup(newBlockStart, newNodeType);
+                }
+              } else {
+                // Custom element transition
+                const customNodeType = schema.nodes['customElement'];
+                const nextRule = activeTemplate.rules[nextType];
+                if (customNodeType && nextRule) {
+                  tr.setNodeMarkup(newBlockStart, customNodeType, {
+                    customTypeId: nextType,
+                    customLabel: nextRule.label,
+                  });
+                }
+              }
+              const prevResolved = tr.doc.resolve(newBlockStart - 1);
+              const prevBlockStart = prevResolved.before(prevResolved.depth);
+              const origNodeType = schema.nodes[currentType] || schema.nodes['customElement'];
+              if (origNodeType && tr.doc.nodeAt(prevBlockStart)?.type.name !== currentType) {
+                if (schema.nodes[currentType]) {
+                  tr.setNodeMarkup(prevBlockStart, schema.nodes[currentType]);
+                }
+                // For customElement, the type is already correct from splitBlock
+              }
+            }
+            if (tr.steps.length > 0) {
+              editor.view.dispatch(tr);
+            }
+            return true;
+          },
+        };
+      },
+    })
+  );
+
+  // Element shortcuts: Mod-1 through Mod-8 to set element type
+  const [ElementShortcutExtension] = React.useState(() =>
+    Extension.create({
+      name: 'elementShortcuts',
+      priority: 999,
+      addKeyboardShortcuts() {
+        // Final Draft numbering: 1 Scene Heading, 2 Action, 3 Character, 4 Parenthetical,
+        // 5 Dialogue, 6 Transition, 7 Shot. (Cast List and New Act are hidden here.)
+        const types = ['sceneHeading', 'action', 'character', 'parenthetical', 'dialogue', 'transition', 'shot'];
+        const shortcuts: Record<string, any> = {};
+        shortcuts['Mod-0'] = ({ editor }: { editor: any }) => {
+          if (!editor.schema.nodes.general) return false;
+          editor.chain().focus().setNode('general').run();
+          return true;
+        };
+        // Ctrl+; applies the template's custom Alt element.
+        shortcuts['Mod-;'] = ({ editor }: { editor: any }) => {
+          if (!editor.schema.nodes.customElement) return false;
+          editor.chain().focus().setNode('customElement', { customTypeId: 'alt', customLabel: 'Alt' }).run();
+          return true;
+        };
+        types.forEach((type, i) => {
+          shortcuts[`Mod-${i + 1}`] = ({ editor }: { editor: any }) => {
+            if (!editor.schema.nodes[type]) return false;
+            editor.chain().focus().setNode(type).run();
+            return true;
+          };
+        });
+        return shortcuts;
+      },
+    })
+  );
+
+  // Paste as Fountain: Mod-Shift-V runs the clipboard through the Fountain
+  // parser so a pasted script arrives as real elements, not one block of text.
+  const [PasteFountainExtension] = React.useState(() =>
+    Extension.create({
+      name: 'pasteFountain',
+      priority: 999,
+      addKeyboardShortcuts() {
+        return {
+          'Mod-Shift-v': ({ editor }) => {
+            // Clipboard reads are async; the handler still claims the key so
+            // the browser's own paste-as-plain-text doesn't also fire.
+            pasteAsFountain(editor).then((result) => {
+              if (!result.ok && result.error) showToast(result.error, 'error');
+            });
+            return true;
+          },
+        };
+      },
+    })
+  );
+
+  // Centralized Tab handler — reads nextOnTab from active template
+  const [TabHandlerExtension] = React.useState(() =>
+    Extension.create({
+      name: 'tabHandler',
+      priority: 1000,
+      addKeyboardShortcuts() {
+        return {
+          Tab: ({ editor }) => {
+            const { $from } = editor.state.selection;
+            const currentNode = $from.parent;
+            const currentType = currentNode.type.name;
+
+            // For custom elements, look up by customTypeId
+            const effectiveType = currentType === 'customElement'
+              ? (currentNode.attrs?.customTypeId || currentType)
+              : currentType;
+
+            const templateStore = useFormattingTemplateStore.getState();
+            const activeTemplate = templateStore.getActiveTemplate();
+            const rule = activeTemplate.rules[effectiveType];
+
+            if (!rule?.nextOnTab) return false;
+
+            const nextId = rule.nextOnTab;
+            // Check if next type is a built-in or custom element
+            const isBuiltIn = ALL_ELEMENT_TYPES.includes(nextId as ElementType);
+
+            // On an empty line Tab turns that line into the next element, as in
+            // Final Draft. Splitting first left a blank line of the old type
+            // behind, which threw off the spacing between characters.
+            const onEmptyLine = currentNode.content.size === 0;
+            const startNext = () => (onEmptyLine ? editor.chain() : editor.chain().splitBlock());
+
+            if (isBuiltIn) {
+              return startNext().setNode(nextId).run();
+            } else {
+              // Custom element
+              const nextRule = activeTemplate.rules[nextId];
+              if (nextRule) {
+                return startNext().setNode('customElement', {
+                  customTypeId: nextId,
+                  customLabel: nextRule.label,
+                }).run();
+              }
+            }
+            return false;
+          },
+        };
+      },
+    })
+  );
+
+  // Build collaboration extensions when in collab mode
+  const collabExtensions = useMemo(() => {
+    const provider = liveProviderRef.current;
+    if (!collabMode || !ydocRef.current || !provider) {
+      return [];
+    }
+    return [
+      Collaboration.configure({
+        document: ydocRef.current,
+      }),
+      CollaborationCursor.configure({
+        provider,
+        user: { name: collabUserName, color: collabColor },
+      }),
+    ];
+  }, [collabMode, collabUserName, collabColor, editorKey]);
+
+  const editor = useEditor({
+    extensions: [
+      Document.extend({
+        content: 'block+',
+      }),
+      // HardBreakLeafText must travel with ScreenplayHardBreak — see that module.
+      Text, ScreenplayHardBreak, HardBreakLeafText,
+      Bold, Italic, Underline, Strike, Dropcursor, Gapcursor,
+      Subscript, Superscript,
+      PastedHighlight.configure({ multicolor: true }),
+      RevisionTextStyle, InkAwareColor, FontFamily, FontSize, PasteFormatting,
+      FormatOverride, CustomElement, ScreenplayImage,
+      // Use History in normal mode, Collaboration in collab mode
+      ...(collabMode ? collabExtensions : [History.configure({ newGroupDelay: 150 })]),
+      TextAlign.configure({ types: [...ALL_ELEMENT_TYPES, 'customElement'] }),
+      Placeholder.configure({
+        placeholder: ({ node }) => {
+          // Check template rules first for custom placeholders
+          const tplStore = useFormattingTemplateStore.getState();
+          const tpl = tplStore.getActiveTemplate();
+          // For custom elements, use customTypeId attribute
+          if (node.type.name === 'customElement') {
+            const customTypeId = node.attrs?.customTypeId;
+            if (customTypeId && tpl.rules[customTypeId]) {
+              return tpl.rules[customTypeId].placeholder || '';
+            }
+            return '';
+          }
+          // For built-in elements, check template rule
+          if (tpl.rules[node.type.name]?.placeholder) {
+            return tpl.rules[node.type.name].placeholder;
+          }
+          // Fallback defaults
+          const m: Record<string, string> = {
+            sceneHeading: 'INT./EXT. LOCATION - TIME', action: 'Describe what happens...',
+            character: 'CHARACTER NAME', dialogue: 'Dialogue...',
+            parenthetical: '(direction)', transition: 'CUT TO:',
+            general: 'Text...', shot: 'SHOT DESCRIPTION',
+            newAct: 'ACT ONE', endOfAct: 'END OF ACT',
+            lyrics: 'Lyrics...', showEpisode: 'SHOW TITLE', castList: 'Cast...',
+            section: 'Section name (outline only)', note: 'Note (not printed)',
+          };
+          return m[node.type.name] || '';
+        },
+      }),
+      SceneHeading, Action, Character, Dialogue, Parenthetical,
+      Transition, General, Shot, NewAct, EndOfAct, Lyrics,
+      Section, Note,
+      ShowEpisode, CastList, DualDialogue, DualDialogueColumn, TitlePage,
+      AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage, AvKeymap, AvCueDecorations,
+      ScriptNoteMark, TagMark,
+      RevisionMark.configure({
+        // A checked-in draft is read-only: draw its revisions, add none.
+        getConfig: () => {
+          const st = useEditorStore.getState();
+          return { enabled: st.revisionMode, color: st.revisionColor };
+        },
+        getSettings: () => useEditorStore.getState().revisionSettings,
+      }),
+      StartsNewPage,
+      FdxFidelity,
+      FdxAdornment,
+      LockedPages,
+      FootnoteMarkerExtension,
+      PaginationExtension,
+      ContdCaseExtension,
+      SearchExtension,
+      TrackChangesExtension,
+      EnforceGuardExtension, EnterHandlerExtension, TabHandlerExtension, ElementShortcutExtension, PasteFountainExtension,
+      SpellCheck,
+      Grammar,
+      ...pluginRegistry.getEditorExtensions(),
+    ],
+    // In collab mode, pass fetched content so TipTap seeds the Yjs doc on first connect.
+    // For normal editing from URL, content is loaded later via useEffect.
+    content: collabMode
+      ? (collabInitialContent.current || { type: 'doc', content: [{ type: 'sceneHeading', content: [] }] })
+      : { type: 'doc', content: [{ type: 'sceneHeading', content: [] }] },
+    autofocus: 'start',
+    editable: !(collabMode && collabRole === 'viewer'),
+    editorProps: {
+      attributes: { class: 'screenplay-content', spellcheck: 'false' },
+      // A script note paints itself with an inline background, and the pasted
+      // highlight rule matches any element carrying one — so pasting a noted
+      // passage back used to lay a second highlight over it. See
+      // editor/stripNoteBackgrounds.
+      transformPastedHTML: (html) => stripNoteBackgrounds(html),
+    },
+    onSelectionUpdate: ({ editor: ed }) => {
+      const type = resolveActiveElement(ed);
+      if (type) setActiveElement(type);
+    },
+  }, [editorKey]);
+
+  // Keep editor ref updated for onSynced callback
+  collabEditorRef.current = editor;
+
+  // When a live session ends, put the script back into the plain editor so
+  // whoever leaves keeps a copy.
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || collabMode) return;
+    const saved = liveRestoreRef.current;
+    if (!saved) return;
+    // The old editor is still bound to the shared document; wait for the new one.
+    if (editor.extensionManager.extensions.some((ext) => ext.name === 'collaboration')) return;
+    liveRestoreRef.current = null;
+    editor.commands.setContent(saved, true);
+  }, [editor, collabMode]);
+
+  // Route native undo/redo (e.g. the system Undo) to the editor
+  useEffect(() => {
+    if (!editor) return;
+    const handleBeforeInput = (e: Event) => {
+      // prosemirror-history (1.5+) answers historyUndo/historyRedo itself when
+      // the event reaches the editor, and marks it handled. Acting again here
+      // undid two steps for one Cmd+Z whenever the browser routed its native
+      // undo through the editor — after any click outside it, a closed dialog
+      // or a menu. This is only for the events ProseMirror never saw.
+      if (e.defaultPrevented) return;
+      const ie = e as InputEvent;
+      if (ie.inputType === 'historyUndo') {
+        e.preventDefault();
+        try { editor.chain().undo().run(); } catch {}
+      } else if (ie.inputType === 'historyRedo') {
+        e.preventDefault();
+        try { editor.chain().redo().run(); } catch {}
+      }
+    };
+    document.addEventListener('beforeinput', handleBeforeInput);
+    return () => document.removeEventListener('beforeinput', handleBeforeInput);
+  }, [editor]);
+
+  // ── Dynamic CSS injection for custom formatting templates ──
+  const activeTemplateId = useFormattingTemplateStore((s) => s.activeTemplateId);
+  const templatesLoaded = useFormattingTemplateStore((s) => s.loaded);
+  const templates = useFormattingTemplateStore((s) => s.templates);
+  const sceneHeadingSpaceBefore = useEditorStore((s) => s.sceneHeadingSpaceBefore);
+
+  useEffect(() => {
+    // Load templates on mount
+    useFormattingTemplateStore.getState().loadTemplates();
+  }, []);
+
+  useEffect(() => {
+    const template = useFormattingTemplateStore.getState().getActiveTemplate();
+    // A document pinned to its original scene-heading spacing overrides whatever
+    // the template says, including the static industry-standard stylesheet.
+    // Without this the editor would show the new two-line gap while pagination
+    // and the exporters used the pinned one — the exact desync this whole
+    // change exists to remove.
+    const overrideCss = typeof sceneHeadingSpaceBefore === 'number'
+      ? `.screenplay-content .scene-heading { margin-top: ${sceneHeadingSpaceBefore}pt; }\n`
+        + '.screenplay-content .scene-heading:first-child { margin-top: 0; }'
+      : '';
+    // If the resolved template is industry standard, the body elements are
+    // served by the static stylesheet — but the title page is not. It has no
+    // static rules a template can reach, so its own are emitted even here, or
+    // setting a title-page font would work on every template except the one
+    // most writers are using.
+    if (template.id === '__industry_standard__') {
+      const titlePageCss = generateTemplateCss(template, pageLayout, { titlePageOnly: true });
+      const colorCss = generateTemplateColorCss(template, pageLayout);
+      const combined = [titlePageCss, colorCss, overrideCss].filter(Boolean).join('\n');
+      injectTemplateCss(combined || null);
+      return () => { injectTemplateCss(null); };
+    }
+    const css = generateTemplateCss(template, pageLayout);
+    injectTemplateCss(overrideCss ? `${css}\n${overrideCss}` : css);
+
+    return () => { injectTemplateCss(null); };
+  }, [activeTemplateId, templatesLoaded, templates, pageLayout, sceneHeadingSpaceBefore]);
+
+  // --- Image insertion: upload to the project's assets, then insert a node that
+  // references the asset (keeps the document small). Falls back to an inline data
+  // URL only when there is no project to upload to. ---
+  const imageFileInputRef = useRef<HTMLInputElement>(null);
+  // The cursor position captured when the menu/toolbar triggers image insertion,
+  // so the upload's async gap (file dialog) doesn't lose the insertion point.
+  const imageInsertPosRef = useRef<number | null>(null);
+  const setImageInsertHandler = useEditorStore((s) => s.setImageInsertHandler);
+  useEffect(() => {
+    setImageInsertHandler(() => {
+      imageInsertPosRef.current = editor ? editor.state.selection.to : null;
+      imageFileInputRef.current?.click();
+    });
+    return () => setImageInsertHandler(null);
+  }, [setImageInsertHandler, editor]);
+
+  const handleImageFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file
+    if (!file || !editor) return;
+    if (!file.type.startsWith('image/')) { showToast('Please choose an image file', 'error'); return; }
+    // Insert at the captured cursor position (valid block position), not doc start.
+    const pos = imageInsertPosRef.current ?? editor.state.selection.to;
+    try {
+      // Shared with paste and drop: a project asset when there is a project, the
+      // scratch store when there isn't, and never bytes inside the document.
+      const attrs = await buildImageAttrs(file);
+      insertImageNode(editor, attrs, pos);
+      warnIfImageDegraded(attrs);
+    } catch (err) {
+      showToast(`Failed to insert image: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor]);
+
+  // The revision gutter measures on editor updates; a change of mark (Revision
+  // Settings, or a collaborator's) changes no document, so nudge it to redraw.
+  const revisionSettings = useEditorStore((st) => st.revisionSettings);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try {
+      editor.view.dispatch(editor.state.tr.setMeta('addToHistory', false));
+    } catch (err) {
+      console.warn('[revisions] could not redraw revision marks', err);
+    }
+  }, [editor, revisionSettings]);
+
+  // --- Scene navigator + scene number assignment ---
+  // The numbering rules — locked numbers kept, A-numbers for inserted scenes,
+  // numbers that survive being hidden — live in utils/sceneNumbers.
+  const updateScenes = useCallback(() => {
+    if (!editor) return;
+    const { sceneNumbersLocked: locked, sceneNumbersVisible: visible } = useEditorStore.getState();
+    const headings: { pos: number; node: import('@tiptap/pm/model').Node }[] = [];
+    editor.state.doc.descendants((node, pos) => {
+      if (node.type.name === 'sceneHeading') headings.push({ pos, node });
+      return true;
+    });
+    const numbers = assignSceneNumbers(
+      headings.map((h) => (h.node.attrs.sceneNumber == null ? null : String(h.node.attrs.sceneNumber))),
+      { visible, locked },
+    );
+    const list: SceneInfo[] = headings.map(({ node }, i) => ({
+      id: `scene-${i + 1}`,
+      heading: node.textContent || 'Untitled Scene',
+      // The navigator always shows a number; hidden unlocked numbers are
+      // just the scene's place in the script.
+      sceneNumber: numbers[i] ?? String(i + 1),
+      color: node.attrs.sceneColor || '',
+      synopsis: node.attrs.synopsis || '',
+    }));
+    const attrUpdates = headings
+      .map((h, i) => ({ pos: h.pos, number: numbers[i], was: h.node.attrs.sceneNumber }))
+      .filter((u) => (u.was == null ? null : String(u.was)) !== u.number);
+    // Batch attribute updates in a single transaction
+    if (attrUpdates.length > 0) {
+      const { tr } = editor.state;
+      for (const { pos, number } of attrUpdates) {
+        tr.setNodeAttribute(pos, 'sceneNumber', number);
+      }
+      tr.setMeta('addToHistory', false);
+      editor.view.dispatch(tr);
+    }
+    setScenes(list);
+  }, [editor, setScenes]);
+
+  useEffect(() => {
+    if (!editor) return;
+    updateScenes();
+    editor.on('update', updateScenes);
+    return () => { editor.off('update', updateScenes); };
+  }, [editor, updateScenes]);
+
+  // Re-run when scene numbering visibility or lock state changes
+  useEffect(() => {
+    if (editor) updateScenes();
+  }, [editor, sceneNumbersVisible, sceneNumbersLocked, updateScenes]);
+
+  // --- Collect character names from document ---
+  // `characterKey` (utils/nodeText) is the one normalization: collapse hard
+  // breaks to spaces, drop extensions like (CONT'D)/(V.O.)/(O.S.), uppercase.
+  // Every site that compares a cue to a stored name must use it on both sides.
+  const { setCharacters } = useEditorStore();
+  // Per-document "Mores & Continueds" config. Reactive: editing it re-runs the
+  // CONT'D effect and re-renders the page-break markers.
+  const moresContds = resolveMoresContds(pageLayout);
+  const { characterContd, contdText } = moresContds;
+
+  // ── Header / footer ───────────────────────────────────────────────────────
+  // One template per document, drawn on every page it applies to and editable
+  // in place. `editingBand` names the single band instance holding the caret —
+  // the kind plus the printed page it was opened on, so double-clicking the
+  // header on page 4 doesn't open every other page's header at the same time.
+  const headerFooter = resolveHeaderFooter(pageLayout);
+  const [editingBand, setEditingBand] = useState<{ kind: BandKind; page: number } | null>(null);
+  const { headerFooterOpen, setHeaderFooterOpen } = useEditorStore();
+
+  const commitBand = useCallback(
+    (kind: BandKind, next: HeaderFooterContent) => {
+      const store = useEditorStore.getState();
+      const key = kind === 'header' ? 'headerContent' : 'footerContent';
+      store.setPageLayout({ ...store.pageLayout, [key]: next });
+      setEditingBand(null);
+    },
+    [],
+  );
+
+  // Which band the dialog should land in, when it was opened from one.
+  const [headerFooterFocus, setHeaderFooterFocus] = useState<BandKind | undefined>(undefined);
+  const openHeaderFooterSettings = useCallback(
+    (band?: BandKind) => {
+      setEditingBand(null);
+      setHeaderFooterFocus(band);
+      setHeaderFooterOpen(true);
+    },
+    [setHeaderFooterOpen],
+  );
+
+  const { documentTitle: hfDocTitle, revisionColor: hfRevColor, pageCount: hfPageCount, pageLabels } = useEditorStore();
+  /** A locked page's printed label, by script page index; undefined when
+   *  pages are not locked and the band prints its number. */
+  const lockedLabel = useCallback(
+    (pageIndex: number): string | undefined => pageLabels?.[pageIndex - 1],
+    [pageLabels],
+  );
+  // `{pages}` reads as the number on the LAST page, so it stays consistent with
+  // `{page}` once the starting number is offset.
+  const hfTotalPrinted = printedPageNumber(Math.max(1, hfPageCount || 1), headerFooter.startingPageNumber);
+
+  const renderHFBand = useCallback(
+    (kind: BandKind, printedPage: number, pageLabel?: string) => (
+      <HeaderFooterBand
+        kind={kind}
+        content={kind === 'header' ? headerFooter.headerContent : headerFooter.footerContent}
+        printedPage={printedPage}
+        pageLabel={pageLabel}
+        totalPages={hfTotalPrinted}
+        docTitle={hfDocTitle}
+        revisionColor={hfRevColor}
+        editable={collabRole !== 'viewer'}
+        editing={editingBand?.kind === kind && editingBand.page === printedPage}
+        onStartEdit={() => setEditingBand({ kind, page: printedPage })}
+        onCommit={(next) => commitBand(kind, next)}
+        onCancel={() => setEditingBand(null)}
+        onOpenSettings={() => openHeaderFooterSettings(kind)}
+        // Follow the margin settings rather than the CSS default, so moving the
+        // header on screen moves it in the PDF by the same amount.
+        style={
+          kind === 'header'
+            ? { top: `${pageLayout.headerMargin}pt` }
+            : { bottom: `${pageLayout.footerMargin}pt` }
+        }
+      />
+    ),
+    [
+      headerFooter.headerContent, headerFooter.footerContent, hfTotalPrinted,
+      hfDocTitle, hfRevColor, collabRole, editingBand,
+      commitBand, openHeaderFooterSettings,
+      pageLayout.headerMargin, pageLayout.footerMargin,
+    ],
+  );
+
+  const updateCharacters = useCallback(() => {
+    if (!editor) return;
+    const names = new Set<string>();
+    editor.state.doc.descendants((node) => {
+      if (node.type.name === 'character') {
+        const base = characterKey(node.textContent);
+        if (base) names.add(base);
+      }
+      return true;
+    });
+    const sorted = Array.from(names).sort();
+    setKnownCharacters(sorted);
+    setCharacters(sorted);
+  }, [editor, setCharacters]);
+
+  useEffect(() => {
+    if (!editor) return;
+    updateCharacters();
+    // Only update character list when the cursor leaves a character node
+    // (i.e., user finished typing the name and pressed Enter / moved away)
+    let prevInCharNode = false;
+    const handleSelectionUpdate = () => {
+      const { $from } = editor.state.selection;
+      const inCharNode = $from.parent.type.name === 'character';
+      // Update when leaving a character node, or when entering a non-character node after being in one
+      if (prevInCharNode && !inCharNode) {
+        updateCharacters();
+      }
+      prevInCharNode = inCharNode;
+    };
+    // Also update on transaction that changes node type (e.g., setNode from character to dialogue)
+    const handleUpdate = ({ transaction }: { transaction: { docChanged: boolean } }) => {
+      if (!transaction.docChanged) return;
+      const { $from } = editor.state.selection;
+      if ($from.parent.type.name !== 'character') {
+        updateCharacters();
+      }
+    };
+    editor.on('selectionUpdate', handleSelectionUpdate);
+    editor.on('update', handleUpdate);
+    return () => {
+      editor.off('selectionUpdate', handleSelectionUpdate);
+      editor.off('update', handleUpdate);
+    };
+  }, [editor, updateCharacters]);
+
+  // --- Auto CONT'D: add/remove (CONT'D) based on previous dialogue ---
+  // Industry rule (Final Draft / WriterDuet / Fade In): append the continued
+  // marker when the same character resumes speaking after action *within the same
+  // scene*. A scene heading / transition resets continuation. A per-cue override
+  // remembers when the writer deletes it so it is not re-added there. Gated by the
+  // per-document characterContd setting; page-break (CONT'D)/(MORE) is separate.
+  useEffect(() => {
+    if (!editor || !characterContd) return;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    // Configured marker, e.g. "(CONT'D)".
+    const contdMarker = contdText.trim() || "(CONT'D)";
+
+    const updateContd = () => {
+      const { doc } = editor.state;
+
+      // Collect every top-level block. `nodeSize` travels with each one so the
+      // replace range is derived from it rather than from the text length —
+      // the latter is short by one per hard break, which would leave the tail
+      // of the cue behind and duplicate it.
+      const blocks: ContdBlock[] = [];
+      doc.forEach((node, offset) => {
+        blocks.push({
+          type: node.type.name,
+          text: node.textContent,
+          pos: offset,
+          nodeSize: node.nodeSize,
+          attrs: node.attrs,
+        });
+      });
+
+      const changes = computeContdChanges(blocks, { contdMarker });
+      if (changes.length === 0) return;
+
+      // Apply changes in reverse document order so earlier positions don't shift.
+      const { tr } = editor.state;
+      for (let i = changes.length - 1; i >= 0; i--) {
+        const c = changes[i];
+        if (c.attrs) tr.setNodeMarkup(c.pos, undefined, c.attrs);
+        if (c.oldText !== null && c.newText !== null) {
+          tr.insertText(c.newText, c.from, c.to);
+        }
+      }
+      tr.setMeta('addToHistory', false);
+      // Tagged so the unsaved-changes listener can tell this tidy-up from an edit.
+      tr.setMeta('contdSync', true);
+      editor.view.dispatch(tr);
+    };
+
+    const debouncedUpdate = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(updateContd, 800);
+    };
+
+    editor.on('update', debouncedUpdate);
+    setTimeout(updateContd, 500);
+    return () => {
+      editor.off('update', debouncedUpdate);
+      if (timeout) clearTimeout(timeout);
+    };
+  }, [editor, characterContd, contdText]);
+
+  // --- Autocomplete: show/update on each editor update while in a character block
+  //     (known names) or a scene heading (scene intros such as INT. / EXT.) ---
+  useEffect(() => {
+    if (!editor) return;
+    const SCENE_INTROS = ['INT.', 'EXT.', 'INT./EXT.', 'EXT./INT.', 'I/E.'];
+    const SCENE_TIMES = [
+      'DAY', 'NIGHT', 'DAWN', 'DUSK', 'MORNING', 'AFTERNOON', 'EVENING',
+      'CONTINUOUS', 'LATER', 'LATER THAT DAY', 'MOMENTS LATER', 'SOON',
+      'SHORTLY', 'SHORTLY AFTER', 'SAME', 'SAME TIME',
+    ];
+    const onUpdate = () => {
+      const inScene = editor.isActive('sceneHeading');
+      if (!editor.isActive('character') && !inScene) {
+        setCharAutoState(s => s.visible ? { ...s, visible: false } : s);
+        charAutoDismissedRef.current = false;
+        return;
+      }
+      if (charAutoDismissedRef.current) return;
+
+      const { $from } = editor.state.selection;
+
+      // Scene heading: offer the scene intros while the heading is still just
+      // the first few letters of one. Picking one writes it plus a space.
+      if (inScene) {
+        const headingText = $from.parent.textContent;
+        const atEnd = $from.parentOffset === $from.parent.content.size;
+
+        // After " - " offer the times of day, replacing only what follows it.
+        const dash = headingText.lastIndexOf(' - ');
+        if (dash >= 0) {
+          const fragment = headingText.slice(dash + 3).toUpperCase();
+          const times = SCENE_TIMES.filter(n => n.startsWith(fragment));
+          if (!atEnd || SCENE_TIMES.includes(fragment) || times.length === 0) {
+            setCharAutoState(s => s.visible ? { ...s, visible: false } : s);
+            return;
+          }
+          const timeCoords = editor.view.coordsAtPos(editor.state.selection.from);
+          setCharAutoState({
+            visible: true,
+            position: { top: timeCoords.bottom + 4, left: timeCoords.left },
+            suggestions: times,
+            replaceFrom: dash + 3,
+          });
+          return;
+        }
+
+        const typed = headingText.toUpperCase();
+        const intros = SCENE_INTROS.filter(n => n.startsWith(typed));
+        if (!typed || !atEnd || SCENE_INTROS.includes(typed) || intros.length === 0) {
+          setCharAutoState(s => s.visible ? { ...s, visible: false } : s);
+          return;
+        }
+        const coords = editor.view.coordsAtPos(editor.state.selection.from);
+        setCharAutoState({
+          visible: true,
+          position: { top: coords.bottom + 4, left: coords.left },
+          suggestions: intros.map(n => `${n} `),
+        });
+        return;
+      }
+
+      const text = characterKey($from.parent.textContent);
+      if (!text) {
+        setCharAutoState(s => s.visible ? { ...s, visible: false } : s);
+        charAutoDismissedRef.current = false;
+        return;
+      }
+
+      // Filter known characters that start with typed text (exclude exact match)
+      // Only match against base names (without extensions)
+      // Names in the script plus any added by hand in the Characters panel,
+      // so a cast can be preloaded before anyone has spoken.
+      const presetNames = useEditorStore.getState().characterProfiles.map((p) => p.name);
+      const matches = Array.from(new Set([...knownCharacters, ...presetNames]))
+        .filter((n) => n.startsWith(text) && n !== text)
+        .sort();
+
+      if (matches.length === 0) {
+        setCharAutoState(s => s.visible ? { ...s, visible: false } : s);
+        return;
+      }
+
+      const { from } = editor.state.selection;
+      const coords = editor.view.coordsAtPos(from);
+      setCharAutoState({
+        visible: true,
+        position: { top: coords.bottom + 4, left: coords.left },
+        suggestions: matches,
+      });
+    };
+    editor.on('update', onUpdate);
+    editor.on('selectionUpdate', onUpdate);
+    return () => { editor.off('update', onUpdate); editor.off('selectionUpdate', onUpdate); };
+  }, [editor, knownCharacters]);
+
+  // Re-measure overlays after editor updates (decorations settle)
+  useEffect(() => {
+    if (!editor) return;
+    const run = () => requestAnimationFrame(() => requestAnimationFrame(measureOverlays));
+    editor.on('update', run);
+    // Initial measurement passes
+    const timers = [200, 500, 1000].map(ms => setTimeout(run, ms));
+    return () => { editor.off('update', run); timers.forEach(clearTimeout); };
+  }, [editor, measureOverlays]);
+
+  const footnotePlan = useFootnotePlan(editor);
+  footnotePlanRef.current = footnotePlan;
+  // Changes exactly when the footnotes would lay out differently, so editing a
+  // note's text does not dispatch a repagination on every debounce tick.
+  const footnoteSig = footnotePlanSignature(footnotePlan);
+
+  // Re-paginate when the page layout changes (e.g. after FDX import), when the
+  // active formatting template changes, or when a printing note appears, moves
+  // or grows. None of those touches the document, and the pagination plugin only
+  // recomputes on doc changes — so without this nudge a template's page rules
+  // (forceBreakBefore, lineHeightMultiplier), or the room a footnote needs,
+  // would not take effect until the writer's next keystroke.
+  useEffect(() => {
+    if (!editor) return;
+    const t = setTimeout(() => {
+      const { tr } = editor.state;
+      tr.setMeta('forceRepaginate', true);
+      editor.view.dispatch(tr);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [editor, pageLayout, activeTemplateId, templates, templatesLoaded, sceneHeadingSpaceBefore, footnoteSig]);
+
+  // --- Initialize spell checker on mount ---
+  useEffect(() => {
+    spellChecker.init().catch(() => {});
+  }, []);
+
+  // --- Toggle spell check plugin when store changes ---
+  useEffect(() => {
+    if (!editor) return;
+    const { tr } = editor.state;
+    tr.setMeta(spellCheckPluginKey, { toggle: spellCheckEnabled });
+    editor.view.dispatch(tr);
+  }, [editor, spellCheckEnabled]);
+
+  // --- Spell modal needs decorations to highlight the active word.
+  //     If auto-check is off, enable the plugin while the modal is open and
+  //     restore the store's setting on close. ---
+  useEffect(() => {
+    if (!editor) return;
+    if (!spellModalOpen) return;
+    if (spellCheckEnabled) return; // plugin already on via the toggle effect above
+    const tr1 = editor.state.tr.setMeta(spellCheckPluginKey, { toggle: true });
+    editor.view.dispatch(tr1);
+    return () => {
+      if (editor.isDestroyed) return;
+      // Re-read the latest setting; if user turned auto-check on while the modal was open, leave it on.
+      const stillOff = !useEditorStore.getState().spellCheckEnabled;
+      if (stillOff) {
+        const tr2 = editor.state.tr.setMeta(spellCheckPluginKey, { toggle: false });
+        editor.view.dispatch(tr2);
+      }
+    };
+  }, [editor, spellModalOpen, spellCheckEnabled]);
+
+  // --- Register the local rule-based grammar providers exactly once. ---
+  // retext: style/wordiness checks (passive voice, weak intensifiers, etc.)
+  // harper: actual grammar (subject-verb agreement, tense, articles, ...)
+  useEffect(() => {
+    pluginRegistry.registerGrammarProvider('draftcraft-retext', async (text, baseOffset, signal) => {
+      const enabledSet = new Set<RetextCategory>();
+      const rulesEnabled = useEditorStore.getState().grammarRulesEnabled || {};
+      for (const cat of RETEXT_CATEGORIES) {
+        if (rulesEnabled[cat] !== false) enabledSet.add(cat);
+      }
+      return runRetext(text, baseOffset, enabledSet, signal);
+    });
+    pluginRegistry.registerGrammarProvider('draftcraft-harper', (text, baseOffset, signal) => {
+      return runHarper(text, baseOffset, signal);
+    });
+    return () => {
+      pluginRegistry.unregisterGrammarProvider('draftcraft-retext');
+      pluginRegistry.unregisterGrammarProvider('draftcraft-harper');
+    };
+  }, []);
+
+  // --- Toggle grammar plugin when store changes ---
+  useEffect(() => {
+    if (!editor) return;
+    const { tr } = editor.state;
+    tr.setMeta(grammarPluginKey, { toggle: grammarCheckEnabled });
+    editor.view.dispatch(tr);
+  }, [editor, grammarCheckEnabled]);
+
+  // --- If auto-grammar is off but the modal is open, enable it temporarily. ---
+  useEffect(() => {
+    if (!editor) return;
+    if (!grammarModalOpen) return;
+    if (grammarCheckEnabled) return;
+    const tr1 = editor.state.tr.setMeta(grammarPluginKey, { toggle: true });
+    editor.view.dispatch(tr1);
+    return () => {
+      if (editor.isDestroyed) return;
+      const stillOff = !useEditorStore.getState().grammarCheckEnabled;
+      if (stillOff) {
+        const tr2 = editor.state.tr.setMeta(grammarPluginKey, { toggle: false });
+        editor.view.dispatch(tr2);
+      }
+    };
+  }, [editor, grammarModalOpen, grammarCheckEnabled]);
+
+  // Build a saveable content object: editor JSON + store metadata at top level.
+  // The payload shape lives in utils/saveContent so MenuBar's Cmd+S and the
+  // backup writer cannot drift from it again. Keep the useCallback wrapper —
+  // its identity is a dependency of the auto-save and metadata-save effects.
+  const buildSaveContent = useCallback(
+    (): Record<string, unknown> | undefined => buildSaveContentShared(editor),
+    [editor],
+  );
+
+  // --- Auto-save to the library on a timer if a project/script is active ---
+  // Skip for collab guests — they don't own the document and the project may
+  // not exist on their local backend. The writer can switch it off or change
+  // the interval in Settings → Saving.
+  // A script saved to a file on disk follows this setting too —
+  // see autoSaveAppliesToOpenDocument.
+  const lastSavedJsonRef = useRef<string>('');
+  // Tracks whether the script currently in the editor has real (textful) content
+  // saved. When true, an auto-save that finds the editor body suddenly empty is
+  // treated as an editor glitch (reset/remount) and skipped — never written.
+  //
+  // Seeded from the store rather than `false`: mounting with a script already
+  // open (a remount after a trip to Settings) means a saved script exists that
+  // this mount has not read yet, and until it does, the safe assumption is that
+  // it has content. Starting at `false` left that window unguarded — the only
+  // thing that stopped the blank body being written was the storage-layer guard
+  // throwing, which surfaced as a save-error modal.
+
+  // Guard: suppress auto-save while switching scripts.  During the switch the
+  // store metadata is cleared (0 relationships, 0 profiles, etc.) but the
+  // auto-save closure still holds the OLD project/script IDs.  Without this
+  // guard the auto-save would overwrite the old script with empty metadata.
+  const scriptSwitchingRef = useRef(false);
+  const isCollabGuest = collabMode && !isCollabHost;
+
+  // Subscribed (not getState) so a rename is reflected in the next snapshot's
+  // filename without waiting for an unrelated re-render.
+  const backupDocumentTitle = useEditorStore((s) => s.documentTitle);
+
+  // Timed snapshots to the user's backup folder. Separate from the auto-save
+  // below — different cadence, and it also covers documents that were never
+  // saved to the library. No-ops unless the writer has turned backups on and
+  // chosen a folder.
+  useBackupScheduler({
+    buildSaveContent,
+    documentTitle: backupDocumentTitle,
+    scriptSwitchingRef,
+    isCollabGuest,
+  });
+
+  /**
+   * True while the recovery prompt has the screen. The snapshot loop pauses on
+   * it, so the work being offered cannot be overwritten by whatever the editor
+   * holds behind the dialog while the writer decides.
+   */
+  const [recoveryPromptOpen, setRecoveryPromptOpen] = useState(false);
+  /** Whether the script just loaded predates the two-line scene-heading standard. */
+  const [sceneSpacingPrompt, setSceneSpacingPrompt] = useState(false);
+
+  /**
+   * True while unsaved work from a previous session is still waiting to be
+   * offered back — read synchronously, before the first paint.
+   *
+   * Launch has two modals wanting the same moment: "how would you like to
+   * start?" and "recover unsaved changes?". Asked in that order, the writer
+   * picks a blank page or a sample and is *then* told there was unsaved work,
+   * which is both alarming and backwards. Recovery goes first; the welcome
+   * dialog waits its turn, and only appears if there was nothing to recover or
+   * the writer decided against it.
+   */
+  const [recoveryPending, setRecoveryPending] = useState(() => {
+    try {
+      return hasRecoverableSnapshot();
+    } catch (err) {
+      console.warn('[recovery] could not check for recoverable work:', err);
+      return false;
+    }
+  });
+
+  const handleRecoveryChecked = useCallback((found: boolean) => {
+    if (!found) setRecoveryPending(false);
+  }, []);
+
+  const handleRecoveryOpenChange = useCallback((open: boolean) => {
+    setRecoveryPromptOpen(open);
+    // Closed means the writer has decided, so the welcome dialog can have the
+    // screen if the document is still empty.
+    if (!open) setRecoveryPending(false);
+  }, []);
+
+  /**
+   * Record the writer's answer to the scene-heading spacing offer.
+   *
+   * Either answer is persisted: `null` follows the template's standard two
+   * lines, `12` pins this script to the one it was written with. Marking the
+   * document dirty is deliberate — the choice is only durable once saved, and
+   * without it the prompt would return on the next open.
+   */
+  const handleSceneSpacingAnswer = useCallback((adoptStandard: boolean) => {
+    setSceneSpacingPrompt(false);
+    const store = useEditorStore.getState();
+    store.setSceneHeadingSpaceBefore(adoptStandard ? null : 12);
+    store.setSaveStatus('unsaved');
+  }, []);
+
+  // Two windows on one screenplay auto-save over each other, so say so rather
+  // than let the writer find out later.
+  const documentOriginPath = useEditorStore((s) => s.documentOrigin?.bookmark ?? null);
+  const {
+    openElsewhere,
+    promptTitle: openElsewhereTitle,
+    promptIsPreflight: openElsewhereIsPreflight,
+    openAnyway: openDuplicateAnyway,
+    dismiss: dismissOpenElsewhere,
+  } = useOpenDocumentGuard({
+    originPath: documentOriginPath,
+    documentTitle: backupDocumentTitle,
+    ready: !!editor,
+  });
+
+  /**
+   * Hand the document back to the window that already had it.
+   *
+   * Bringing the other window forward is only half of it: this window has the
+   * same screenplay loaded, and leaving it there is the very thing the prompt
+   * exists to prevent — two editors auto-saving one document. So it steps back
+   * to an empty screenplay and lets go of its claim.
+   *
+   * The route matters as much as the content: on a /project/:id/edit/:scriptId
+   * URL the script would simply be loaded again on the next render.
+   */
+  const switchToOtherWindow = useCallback(async () => {
+    if (!openElsewhere) return;
+    const target = openElsewhere.window;
+    // Captured before dismissing: a pre-flight prompt means this window never
+    // loaded the document, so whatever it *is* showing must be left alone.
+    const wasPreflight = openElsewhereIsPreflight;
+    dismissOpenElsewhere();
+
+    try {
+      const { focusWindow, releaseOpenDocument } = await import('../services/openDocuments');
+      await focusWindow(target);
+      releaseOpenDocument();
+    } catch (err) {
+      // Reported, but this window still steps away: the other window has the
+      // document either way, and two live copies is the outcome to avoid.
+      showToast(
+        `Could not switch windows: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+
+    // Only when this window actually loaded the duplicate. Asked before the
+    // load, there is nothing here to step away from — and clearing would throw
+    // away the screenplay the writer already had open.
+    if (wasPreflight) return;
+
+    navigate('/', { replace: true });
+    useEditorStore.getState().setImportedSource(null);
+    setDocumentTitle('Untitled Screenplay');
+    if (editor) {
+      // See File ▸ Close: an emptied document has no block to type into.
+      editor.commands.setContent({ type: 'doc', content: [{ type: 'sceneHeading', content: [] }] }, true);
+      clearEditorHistory(editor);
+    }
+    // Nothing here is worth auto-saving or snapshotting now.
+    lastSavedJsonRef.current = '';
+    useEditorStore.getState().setSaveStatus('saved');
+  }, [
+    openElsewhere,
+    openElsewhereIsPreflight,
+    dismissOpenElsewhere,
+    editor,
+    navigate,
+    setDocumentTitle,
+  ]);
+
+  /**
+   * Put a recovered session back into the editor.
+   *
+   * Mirrors the import path: the snapshot is content, not a stored script, so
+   * it is applied to the editor and left for the user to save.
+   */
+  const handleRecoveryRestore = useCallback((snapshot: RecoverySnapshot) => {
+    if (!editor || editor.isDestroyed) return;
+
+    const { pmDoc } = stripSaveMetadata(snapshot.content);
+
+    editor.commands.setContent(pmDoc, true);
+    clearEditorHistory(editor);
+    hydrateEditorStoresFromContent(snapshot.content);
+    // Resync by hand: `setContent` raises `selectionUpdate` only when the
+    // mapped selection differs from the old one, so a restore can leave the
+    // store naming the element the *previous* document's caret was on. For a
+    // recovered AV script that meant the toolbar was still scoped to the blank
+    // screenplay it replaced — an element list whose types an avCell rejects,
+    // and no AV row buttons — with nothing left to move the caret and put it
+    // right.
+    const restoredElement = resolveActiveElement(editor);
+    if (restoredElement) setActiveElement(restoredElement);
+    setDocumentTitle(snapshot.title || 'Untitled Screenplay');
+    // Recovered content is not the file any in-place origin points at, and the
+    // snapshot does not carry the origin's security-scoped bookmark. Clearing
+    // it stops Save from writing recovered text over an unrelated document.
+    useEditorStore.getState().setImportedSource(null);
+
+    // The restored body is unsaved by definition — clear the auto-save
+    // comparison so the next tick writes it rather than deciding nothing
+    // changed against whatever was loaded before.
+    lastSavedJsonRef.current = '';
+    setShowWelcome(false);
+    useBackupStatusStore.getState().noteDocumentOpened();
+    useEditorStore.getState().setSaveStatus('unsaved');
+    showToast('Unsaved changes restored from your last session.', 'success');
+
+    // A snapshot written by an older build can carry its images inline. Moving
+    // them into the scratch store shrinks the payload immediately, so the
+    // restored document is protected again rather than staying over the size
+    // limit until the writer happens to save it somewhere.
+    if (docHasInlineImageBytes(snapshot.content)) void demoteDataUrlsToScratch(editor);
+  }, [editor, setDocumentTitle, setActiveElement]);
+
+  // Crash-recovery copy. Unlike the two above it covers every platform and
+  // every document, including one that was never saved to the library — which is the only thing standing between a crash and lost work.
+  useRecoverySnapshot({
+    buildSaveContent,
+    documentTitle: backupDocumentTitle,
+    editor,
+    lastSavedJsonRef,
+    scriptSwitchingRef,
+    isCollabGuest,
+    isPaused: recoveryPromptOpen || recoveryPending,
+    hasEdits: () => (editor ? hasEditsSinceLoad(editor) : false),
+  });
+
+  // Let the scratch sweeper see the document on screen, so it never mistakes a
+  // picture in the open screenplay for an orphan.
+  useEffect(() => {
+    if (!editor) return;
+    setLiveScratchDocSource(() => (editor.isDestroyed ? null : editor.getJSON()));
+    return () => setLiveScratchDocSource(null);
+  }, [editor]);
+
+  // --- Track unsaved changes for status bar ---
+  // A file opened in place needs this as much as a library script: it is what
+  // the close prompt and the file auto-save both read. It used to be tracked
+  // for library scripts only, so edits to an opened file never counted as
+  // unsaved and closing the window dropped them without asking.
+  const hasSaveTarget = Boolean(documentOriginPath);
+  useEffect(() => {
+    if (!editor || !hasSaveTarget || isCollabGuest) return;
+    const markUnsaved = ({ transaction }: { transaction: { getMeta: (key: string) => unknown } }) => {
+      // The automatic (CONT'D) pass rewrites the cues of a freshly opened file.
+      // That is the editor tidying up, not the writer changing anything.
+      if (transaction.getMeta('contdSync')) return;
+      const { saveStatus } = useEditorStore.getState();
+      // Only mark unsaved if we're in idle or saved state (not during saving or error)
+      if (saveStatus === 'idle' || saveStatus === 'saved') {
+        useEditorStore.getState().setSaveStatus('unsaved');
+      }
+    };
+    editor.on('update', markUnsaved);
+    return () => { editor.off('update', markUnsaved); };
+  }, [editor, hasSaveTarget, isCollabGuest]);
+
+  // --- Mark the document unsaved when only its metadata changes ---
+  // Store metadata (profiles, relationships, notes, etc.) can change without an
+  // editor document update, and Save should still know there is something new
+  // to write.
+  useEffect(() => {
+    if (!editor || !hasSaveTarget || isCollabGuest) return;
+    const unsub = useEditorStore.subscribe((state, prev) => {
+      // Only react to metadata field changes
+      if (
+        state.characterRelationships === prev.characterRelationships &&
+        state.characterProfiles === prev.characterProfiles &&
+        state.notes === prev.notes &&
+        state.generalNotes === prev.generalNotes &&
+        state.tags === prev.tags &&
+        state.beats === prev.beats &&
+        state.beatColumns === prev.beatColumns &&
+        state.scriptProfile === prev.scriptProfile &&
+        state.spellCheckEnabled === prev.spellCheckEnabled &&
+        state.grammarCheckEnabled === prev.grammarCheckEnabled
+      ) return;
+      if (scriptSwitchingRef.current) return;
+      const { saveStatus, setSaveStatus } = useEditorStore.getState();
+      if (saveStatus === 'idle' || saveStatus === 'saved') setSaveStatus('unsaved');
+    });
+    return () => { unsub(); };
+  }, [editor, hasSaveTarget, isCollabGuest]);
+
+  // --- Keep the open document across route changes ---
+  // Going to Settings (or any other route) unmounts this component and destroys
+  // the editor, and only a script whose ids are in the URL is refetched below.
+  // Everything else — File → Open, an imported file, an unsaved draft — used to
+  // come back blank. TipTap schedules the destroy a tick after unmount, so the
+  // document is still readable from this cleanup.
+  useEffect(() => {
+    if (!editor || collabMode) return;
+    return () => {
+      if (editor.isDestroyed) return;
+      try {
+        const doc = editor.getJSON();
+        // A blank body is never worth restoring, and stashing one could put an
+        // empty document back over a real one.
+        if (!docHasAnyText(doc)) return;
+        stashSessionDoc({
+          doc,
+          projectId: null,
+          scriptId: null,
+        });
+      } catch (err) {
+        console.warn('Could not stash the open document:', err);
+      }
+    };
+  }, [editor, collabMode]);
+
+  // Put it back on the way in. Skipped when the URL carries script ids — that
+  // load path owns the content and reads the saved version, which is newer than
+  // anything stashed.
+  //
+  // Strictly a mount-time action: the attempt is marked done as soon as the
+  // editor exists, whether or not anything was restored. Retrying later would
+  // mean a stash left over from an earlier document could land on top of a
+  // script that has since been loaded from the library.
+  const sessionRestoreDoneRef = useRef(false);
+  useEffect(() => {
+    if (!editor || collabMode) return;
+    if (sessionRestoreDoneRef.current) return;
+    sessionRestoreDoneRef.current = true;
+
+    const doc = takeSessionDoc(null, null);
+    if (!doc) return;
+    try {
+      editor.commands.setContent(doc as Record<string, unknown>, false);
+      clearEditorHistory(editor);
+      setShowWelcome(false);
+      updateScenes();
+    } catch (err) {
+      console.error('Could not restore the open document:', err);
+      showToast('Could not restore the document you had open', 'error');
+    }
+  }, [editor, collabMode, updateScenes]);
+
+  // --- Sync orphaned marks: runs ONCE after editor is ready, not on every doc change ---
+  const orphanSyncDone = useRef(false);
+  useEffect(() => {
+    if (!editor || orphanSyncDone.current) return;
+    const timer = setTimeout(() => {
+      orphanSyncDone.current = true;
+      const store = useEditorStore.getState();
+      const noteMarkType = editor.schema.marks.scriptNote;
+      const tagMarkType = editor.schema.marks.productionTag;
+      const noteIds = new Set(store.notes.map((n) => n.id));
+      const tagIds = new Set(store.tags.map((t) => t.id));
+      const orphanedNotes: { noteId: string; text: string; elementType: string }[] = [];
+      const orphanedTags: { tagId: string; categoryId: string; color: string; text: string; elementType: string }[] = [];
+
+      editor.state.doc.descendants((node) => {
+        if (!node.isText) return;
+        for (const mark of node.marks) {
+          if (noteMarkType && mark.type === noteMarkType) {
+            const id = mark.attrs.noteId as string;
+            if (id && !noteIds.has(id)) {
+              orphanedNotes.push({ noteId: id, text: node.textContent.slice(0, 80), elementType: 'action' });
+              noteIds.add(id);
+            }
+          }
+          if (tagMarkType && mark.type === tagMarkType) {
+            const id = mark.attrs.tagId as string;
+            if (id && !tagIds.has(id)) {
+              orphanedTags.push({
+                tagId: id,
+                categoryId: (mark.attrs.categoryId as string) || 'props',
+                color: (mark.attrs.color as string) || '#9370DB',
+                text: node.textContent.slice(0, 80),
+                elementType: 'action',
+              });
+              tagIds.add(id);
+            }
+          }
+        }
+      });
+
+      if (orphanedNotes.length > 0) {
+        store.setNotes([...store.notes, ...orphanedNotes.map((o) => ({
+          id: o.noteId, content: '', anchorText: o.text, elementType: o.elementType,
+          contextLabel: '', color: 'Yellow' as const, createdAt: new Date().toISOString(), sceneId: null,
+        }))]);
+      }
+      // Clear highlights an older bug left on top of notes and tags. Done here
+      // because this already runs once, after the document has settled.
+      const swept = sweepStrayNoteHighlights(editor);
+      if (swept > 0) {
+        console.info(`[notes] cleared ${swept} stray highlight(s) left over an annotation`);
+      }
+
+      if (orphanedTags.length > 0) {
+        store.setTags([...store.tags, ...orphanedTags.map((o) => ({
+          id: o.tagId, categoryId: o.categoryId, name: o.text, text: o.text, notes: '',
+          sceneId: null, elementType: o.elementType, createdAt: new Date().toISOString(),
+        }))]);
+      }
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [editor]);
+
+  // --- Scroll → current page tracking ---
+  // ov.top is in the page's unscaled coordinate system; pageRect/containerRect
+  // are in viewport (scaled) space, so ov.top must be multiplied by the zoom
+  // scale before mixing with rect deltas.
+  const handleScroll = useCallback(() => {
+    if (!editorMainRef.current || !pageRef.current) return;
+    const containerTop = editorMainRef.current.getBoundingClientRect().top;
+    const pageTop = pageRef.current.getBoundingClientRect().top;
+    const scale = (zoomLevelRef.current || 100) / 100;
+    let page = 1;
+    for (const ov of overlays) {
+      if (pageTop + ov.top * scale - containerTop < 50) page = ov.pageNumber;
+    }
+    setCurrentPage(page);
+  }, [overlays, setCurrentPage]);
+
+  useEffect(() => {
+    const el = editorMainRef.current;
+    if (!el) return;
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => el.removeEventListener('scroll', handleScroll);
+  }, [handleScroll]);
+
+  // --- Go to page ---
+  // Jump instantly: smooth-scrolling thousands of pixels on a long screenplay
+  // takes seconds. ov.top is unscaled, so multiply by zoom scale to land on
+  // the correct page when zoom != 100%. ov.top sits at the top of the page
+  // separator block (previous page's bottom margin + gap + new page's top
+  // margin). Skip past the previous-page bottom margin and the 40px visual
+  // gap so the new page (with its header line at the top) lands flush with
+  // the viewport top — not flush with the start of the body content, which
+  // would hide the page header and look like we'd overshot.
+  const handleGoToPage = useCallback((page: number) => {
+    if (!editorMainRef.current || !pageRef.current) return;
+    if (page <= 1) {
+      editorMainRef.current.scrollTo({ top: 0, behavior: 'auto' });
+      return;
+    }
+    const ov = overlays.find(o => o.pageNumber === page);
+    if (ov) {
+      const pageRect = pageRef.current.getBoundingClientRect();
+      const containerRect = editorMainRef.current.getBoundingClientRect();
+      const scale = (zoomLevelRef.current || 100) / 100;
+      const layout = pageLayoutRef.current;
+      const bottomMarginPx = (layout.bottomMargin / 72) * 96;
+      const pageTopOffset = ov.top + bottomMarginPx + 40; // 40 = page-sep-gap
+      const scrollTo = editorMainRef.current.scrollTop + (pageRect.top + pageTopOffset * scale - containerRect.top);
+      editorMainRef.current.scrollTo({ top: scrollTo, behavior: 'auto' });
+    }
+  }, [overlays]);
+
+  // Wire up the picker trigger
+  showPickerRef.current = useCallback((defaultType: ElementType, availableTypes?: ElementType[]) => {
+    if (!editor) return;
+    // Use requestAnimationFrame so the DOM has settled after the split
+    requestAnimationFrame(() => {
+      if (!editor.view) return;
+      const { from, $from } = editor.state.selection;
+      const coords = editor.view.coordsAtPos(from);
+      setPickerState({
+        visible: true,
+        position: { top: coords.bottom + 4, left: coords.left },
+        defaultType,
+        availableTypes,
+        blankLine: isBlankBlock($from.parent),
+        avCell: isInAvCell(editor.state),
+      });
+    });
+  }, [editor]);
+
+  // The "menu was refused here" marker only holds for the line it was refused
+  // on: step away and Enter offers the menu again, exactly as it did before.
+  React.useEffect(() => {
+    if (!editor) return;
+    const onSelection = () => {
+      if (pickerDismissedAtRef.current === null) return;
+      const { $from } = editor.state.selection;
+      if ($from.depth === 0 || $from.before($from.depth) !== pickerDismissedAtRef.current) {
+        pickerDismissedAtRef.current = null;
+      }
+    };
+    editor.on('selectionUpdate', onSelection);
+    return () => { editor.off('selectionUpdate', onSelection); };
+  }, [editor]);
+
+  // Adds one blank line at the caret. With no argument it keeps the element
+  // type the writer already has, except where a plain Action is the right
+  // neutral spacer; `typeId` is the writer naming the type outright, which the
+  // element menu does when the row picked is the one the line is already on.
+  insertBlankLineRef.current = useCallback((typeId?: string) => {
+    if (!editor) return;
+    pickerDismissedAtRef.current = null;
+    const node = editor.state.selection.$from.parent;
+    const blankType = typeId ?? blankLineTypeFor(node.type.name, isInAvCell(editor.state));
+    // setNode is not optional. `splitBlock` gives the new node the schema's
+    // default block type whenever the caret sits at the end of a block — always
+    // true on a blank one — and this document's default is `sceneHeading`.
+    const chain = editor.chain().focus().splitBlock();
+    if (editor.schema.nodes[blankType]) {
+      // A customElement carries its identity in attrs, which the split drops.
+      chain.setNode(blankType, blankType === 'customElement' ? { ...node.attrs } : undefined);
+    } else {
+      // An id that exists only as a template rule — same wrapper the menu uses.
+      const rule = useFormattingTemplateStore.getState().getActiveTemplate().rules[blankType];
+      if (!rule) return;
+      chain.setNode('customElement', { customTypeId: blankType, customLabel: rule.label });
+    }
+    chain.run();
+  }, [editor]);
+
+  // The element menu, asked for from outside the editor. Opening it on a line
+  // with text is allowed — it is then an ordinary type chooser.
+  openElementMenuRef.current = useCallback(() => {
+    if (!editor || pickerVisibleRef.current) return;
+    const node = editor.state.selection.$from.parent;
+    if (!node.isTextblock) return;
+    const type = node.type.name === 'customElement'
+      ? (node.attrs?.customTypeId || node.type.name)
+      : node.type.name;
+    showPickerRef.current(type as ElementType);
+  }, [editor]);
+
+  React.useEffect(() => {
+    const onRequest = () => openElementMenuRef.current();
+    const onKey = (e: KeyboardEvent) => {
+      const spec = useSettingsStore.getState().elementMenuShortcut;
+      if (!spec || !matchesShortcut(e, spec)) return;
+      // Only when the writer is actually in the script — the same keys may
+      // mean something else in a dialog or a side panel.
+      if (!editor?.isFocused) return;
+      e.preventDefault();
+      openElementMenuRef.current();
+    };
+    window.addEventListener(ELEMENT_MENU_EVENT, onRequest);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener(ELEMENT_MENU_EVENT, onRequest);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [editor]);
+
+  // Bridge: let the AvKeymap extension surface the same element picker,
+  // restricted to what this column accepts. The keymap knows the side; the
+  // template — which only exists out here — decides what that means.
+  React.useEffect(() => {
+    registerAvCellPicker((defaultType, side) => {
+      const template = useFormattingTemplateStore.getState().getActiveTemplate();
+      const types = avCellElementRules(template, side, defaultType).map(r => r.id as ElementType);
+      showPickerRef.current(defaultType as ElementType, types);
+    });
+    return () => registerAvCellPicker(null);
+  }, []);
+
+  const handlePickerSelect = useCallback((type: ElementType) => {
+    if (!editor) return;
+    pickerDismissedAtRef.current = null;
+    setPickerState(s => ({ ...s, visible: false }));
+
+    // "AV Columns" is not a paragraph type — it inserts a two-column body.
+    // It rides in the element menu because that is where a writer goes to ask
+    // "what is this line?", and a template that offers it has said the format
+    // may contain one. `insertAvRow` places it: beside the current line, never
+    // through it, and joined to an adjacent body rather than stacked on it.
+    if (type === AV_BLOCK_RULE_ID) {
+      editor.chain().focus().insertAvRow('below').run();
+      return;
+    }
+
+    // On a blank line, picking the type that line already has cannot mean
+    // "convert it" — it would be a no-op, and it is the row a writer lands on
+    // most, since the list is ordered current-type first. Read it the only way
+    // it makes sense: one more line of this element. On a line
+    // with text, the same pick really is a no-op, and is left as one.
+    const node = editor.state.selection.$from.parent;
+    const currentId = node.type.name === 'customElement'
+      ? ((node.attrs?.customTypeId as string) || 'customElement')
+      : node.type.name;
+    if (type === currentId && isBlankBlock(node)) {
+      insertBlankLineRef.current(type);
+      return;
+    }
+
+    // setNode works for any real schema node (built-in screenplay elements as
+    // well as the AV inner types avPara/avShot/avDirection). Custom-id elements
+    // declared only in template rules go through the customElement wrapper.
+    if (editor.schema.nodes[type]) {
+      editor.chain().focus().setNode(type).run();
+    } else {
+      const tpl = useFormattingTemplateStore.getState().getActiveTemplate();
+      const rule = tpl.rules[type];
+      if (rule) {
+        editor.chain().focus().setNode('customElement', {
+          customTypeId: type,
+          customLabel: rule.label,
+        }).run();
+      }
+    }
+  }, [editor]);
+
+  const handlePickerInsertLine = useCallback(() => {
+    setPickerState(s => ({ ...s, visible: false }));
+    insertBlankLineRef.current();
+  }, []);
+
+  const handlePickerInsertAvRow = useCallback(() => {
+    setPickerState(s => ({ ...s, visible: false }));
+    editor?.chain().focus().insertAvRow('below').run();
+  }, [editor]);
+
+  const handlePickerDismiss = useCallback(() => {
+    setPickerState(s => ({ ...s, visible: false }));
+    if (editor) {
+      const { $from } = editor.state.selection;
+      pickerDismissedAtRef.current = $from.depth === 0 ? null : $from.before($from.depth);
+    }
+    // Re-focus editor
+    editor?.commands.focus();
+  }, [editor]);
+
+
+  const handleWelcomeChoice = useCallback(async (choice: WelcomeChoice) => {
+    setShowWelcome(false);
+
+    if (choice === 'sample') {
+      editor?.commands.setContent(SAMPLE_CONTENT, true);
+      if (editor) clearEditorHistory(editor);
+    } else if (choice === 'import') {
+      if (!editor) return;
+      try {
+        const { openTextOrBinaryFile } = await import('../utils/fileOps');
+        const result = await openTextOrBinaryFile(SCREENPLAY_IMPORT_FILTERS, BINARY_IMPORT_EXTENSIONS);
+        if (!result) return;
+
+        const { name } = result;
+        const imported = await parseScreenplayImport(name, result.bytes ?? result.text ?? '');
+
+        editor.commands.setContent(imported.doc, true);
+        clearEditorHistory(editor);
+        const scriptTitle = imported.title || name.replace(/\.\w+$/, '') || 'Untitled';
+        useEditorStore.getState().setDocumentTitle(scriptTitle);
+        useEditorStore.getState().setImportedSource({ name, format: imported.formatLabel });
+        for (const w of imported.warnings) console.warn('[Import]', w);
+      } catch (err) {
+        console.error('Import failed:', err);
+        showToast(`Import failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    }
+    // 'blank' — editor already has empty content, nothing to do
+  }, [editor]);
+
+  // ── File association: open files passed by the OS ──────────────────────
+  const handleExternalFile = useCallback(async (filePath: string) => {
+    if (!editor) {
+      console.warn('[file-assoc] editor not ready, ignoring:', filePath);
+      showToast('Editor not ready — please try again', 'error');
+      return;
+    }
+    console.log('[file-assoc] opening:', filePath);
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+
+      let text: string | null = null;
+      let bytes: ArrayBuffer | null = null;
+
+      const filename = filePath.replace(/^.*[\\/]/, '') || 'Untitled';
+      if (isBinaryImportExtension(extensionOf(filename))) {
+        console.log('[file-assoc] reading archive via read_binary_file...');
+        const data = await invoke<number[]>('read_binary_file', { path: filePath });
+        bytes = new Uint8Array(data).buffer;
+        console.log('[file-assoc] read', data.length, 'bytes from', filePath);
+      } else {
+        console.log('[file-assoc] reading file path via read_text_file...');
+        text = await invoke<string>('read_text_file', { path: filePath });
+        console.log('[file-assoc] read', text.length, 'chars from', filePath);
+      }
+
+      const title = filename.replace(/\.\w+$/, '');
+      const imported = await parseScreenplayImport(filename, bytes ?? text ?? '');
+
+      editor.commands.setContent(imported.doc, true);
+      clearEditorHistory(editor);
+      setDocumentTitle(imported.title || title);
+      setShowWelcome(false);
+
+      // Opened *from* a file, so it stays attached to that file where the
+      // platform allows it: double-clicking a screenplay and pressing Save
+      // should update the screenplay, not file a copy into the library.
+      //
+      // A path is a durable handle, so the file stays the document's origin.
+      const inPlace =
+        isDesktopTauri() &&
+        IN_PLACE_ORIGIN_EXTENSIONS.includes(extensionOf(filename));
+
+      if (inPlace) {
+        const format = extensionOf(filename);
+        useEditorStore.getState().setImportedSource(null);
+        useEditorStore.getState().setDocumentOrigin({
+          bookmark: filePath,
+          name: filename,
+          format,
+        });
+        if (format === 'fdx' || format === 'dcraft') {
+          showToast(`Editing ${filename}. Save writes back to this file.`, 'success');
+        } else {
+          // Same explanation the menu's own open gives: this file is in another
+          // application's format, Save rewrites it, and the library is where
+          // the whole screenplay can live.
+          useEditorStore.getState().setForeignFormatNotice({ name: filename, extension: format });
+        }
+      } else {
+        // Mark as imported so Save As shows the "saved to DraftCraft library" notice.
+        useEditorStore.getState().setImportedSource({ name: filename, format: imported.formatLabel });
+      }
+      for (const w of imported.warnings) console.warn('[Import]', w);
+      // A file opened from disk has no library copy at all, so it is the one
+      // that most needs an immediate snapshot.
+      useBackupStatusStore.getState().noteDocumentOpened();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error('Failed to open external file:', filePath, detail, err);
+      showToast(`Failed to open file: ${detail}`, 'error');
+    }
+  }, [editor, setDocumentTitle]);
+
+  useEffect(() => {
+    if (!editor) return;
+
+    let cancelled = false;
+    let unlistenFn: (() => void) | null = null;
+    let handledPath: string | null = null;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let invokeRef: ((cmd: string) => Promise<string | null>) | null = null;
+
+    (async () => {
+      const { isTauri } = await import('../services/platform');
+      if (!isTauri() || cancelled) return;
+
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef = (cmd: string) => invoke<string | null>(cmd);
+
+      // Set up event listener FIRST to catch re-emitted events from Rust.
+      // Use window-scoped listener so emit_to(label) only reaches THIS window
+      // and doesn't replace content in other open windows.
+      try {
+        const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+        const currentWindow = getCurrentWebviewWindow();
+        const unlisten = await currentWindow.listen<string>('open-file', (event) => {
+          if (!cancelled && event.payload !== handledPath) {
+            console.log('[file-assoc] open-file event:', event.payload);
+            handledPath = event.payload;
+            handleExternalFile(event.payload);
+          }
+        });
+        if (cancelled) {
+          unlisten();
+        } else {
+          unlistenFn = unlisten;
+        }
+      } catch (err) {
+        console.error('Failed to listen for open-file events:', err);
+      }
+
+      // Check for a file passed at launch — poll a few times because
+      // on cold start RunEvent::Opened may fire after the WebView loads
+      const pollPending = async (attempt: number) => {
+        if (cancelled || handledPath) return;
+        try {
+          const pending = await invoke<string | null>('get_opened_file');
+          if (pending && !cancelled && pending !== handledPath) {
+            console.log(`[file-assoc] pending file (attempt ${attempt}):`, pending);
+            handledPath = pending;
+            handleExternalFile(pending);
+            return;
+          }
+        } catch (err) {
+          console.error('get_opened_file failed:', err);
+        }
+        // Retry up to 5 times over ~3 seconds for cold-start timing
+        if (attempt < 5 && !cancelled && !handledPath) {
+          pollTimer = setTimeout(() => pollPending(attempt + 1), 600);
+        }
+      };
+      pollPending(1);
+    })();
+
+    // On a warm start the Tauri JS event may not reach the listener
+    // reliably. When the app returns to foreground, re-check the pending
+    // file state.
+    const onVisibilityChange = async () => {
+      if (document.visibilityState !== 'visible' || cancelled || !invokeRef) return;
+      try {
+        // Check pending file state
+        const pending = await invokeRef('get_opened_file');
+        if (pending && pending !== handledPath) {
+          console.log('[file-assoc] foreground check found pending file:', pending);
+          handledPath = pending;
+          handleExternalFile(pending);
+        }
+      } catch (err) {
+        console.error('[file-assoc] foreground check failed:', err);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+      if (pollTimer) clearTimeout(pollTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [editor, handleExternalFile]);
+
+  // ── Drag-and-drop file import ─────────────────────────────────────────
+
+  const importDroppedFile = useCallback(async (file: File) => {
+    if (!editor) return;
+    try {
+      const ext = extensionOf(file.name);
+      const data = isBinaryImportExtension(ext) ? await file.arrayBuffer() : await file.text();
+      const title = file.name.replace(/\.\w+$/, '') || 'Untitled';
+
+      const imported = await parseScreenplayImport(file.name, data);
+
+      editor.commands.setContent(imported.doc, true);
+      clearEditorHistory(editor);
+      setDocumentTitle(imported.title || title);
+      setShowWelcome(false);
+      useEditorStore.getState().setImportedSource({ name: file.name, format: imported.formatLabel });
+      useBackupStatusStore.getState().noteDocumentOpened();
+      for (const w of imported.warnings) console.warn('[Import]', w);
+    } catch (err) {
+      console.error('Failed to import dropped file:', err);
+      showToast(`Failed to import file: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, setDocumentTitle]);
+
+  const handleEditorDragOver = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDragOverEditor(true);
+  }, []);
+
+  const handleEditorDragLeave = useCallback((e: React.DragEvent) => {
+    // Only close if leaving the editor-main container itself
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragOverEditor(false);
+  }, []);
+
+  const handleEditorDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOverEditor(false);
+
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+
+    if (!isImportableExtension(extensionOf(file.name))) {
+      showToast(
+        `Unsupported file type. Drop a ${SCREENPLAY_IMPORT_EXTENSIONS.map((e) => `.${e}`).join(', ')} file.`,
+        'error',
+      );
+      return;
+    }
+
+    confirmBeforeReplacing(() => importDroppedFile(file));
+  }, [importDroppedFile]);
+
+  // ── Tauri native drag-and-drop handler ──
+  // On desktop Tauri, the webview intercepts OS file drops at the native level,
+  // so the browser's drop event may not include the actual files. We listen for
+  // Tauri's onDragDropEvent which provides file paths directly.
+  useEffect(() => {
+    if (!editor) return;
+    let cancelled = false;
+    let unlistenFn: (() => void) | null = null;
+
+    (async () => {
+      const { isTauri } = await import('../services/platform');
+      if (!isTauri() || cancelled) return;
+
+      try {
+        const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+        const { invoke } = await import('@tauri-apps/api/core');
+        const webview = getCurrentWebview();
+
+        const unlisten = await webview.onDragDropEvent((event) => {
+          if (cancelled) return;
+          const payload = event.payload;
+
+          if (payload.type === 'enter' || payload.type === 'over') {
+            setDragOverEditor(true);
+          } else if (payload.type === 'leave') {
+            setDragOverEditor(false);
+          } else if (payload.type === 'drop') {
+            setDragOverEditor(false);
+            // If drop is over the asset manager, forward file paths for upload
+            const pos = payload.position;
+            if (pos) {
+              const el = document.elementFromPoint(pos.x, pos.y);
+              // Font files dropped on the Fonts dialog are installed, not
+              // imported as a script — the dialog reads the paths itself.
+              if (el?.closest('.fonts-dropzone')) {
+                const paths = payload.paths;
+                if (paths && paths.length > 0) {
+                  window.dispatchEvent(new CustomEvent('tauri-font-drop', { detail: { paths } }));
+                }
+                return;
+              }
+              if (el?.closest('.asset-manager')) {
+                const paths = payload.paths;
+                if (paths && paths.length > 0) {
+                  window.dispatchEvent(new CustomEvent('tauri-asset-drop', { detail: { paths } }));
+                }
+                return;
+              }
+            }
+            const paths = payload.paths;
+            if (!paths || paths.length === 0) return;
+            const filePath = paths[0];
+            if (!isImportableExtension(extensionOf(filePath))) {
+              showToast(
+                `Unsupported file type. Drop a ${SCREENPLAY_IMPORT_EXTENSIONS.map((e) => `.${e}`).join(', ')} file.`,
+                'error',
+              );
+              return;
+            }
+
+            // Read the file through Tauri and hand it to the same importer the
+            // browser drop path uses — archives have to be read as bytes.
+            const importTauriFile = async (path: string) => {
+              try {
+                const filename = path.replace(/^.*[\\/]/, '') || 'Untitled';
+                let file: File;
+                if (isBinaryImportExtension(extensionOf(filename))) {
+                  const data = await invoke<number[]>('read_binary_file', { path });
+                  file = new File([new Uint8Array(data)] as BlobPart[], filename, { type: 'application/zip' });
+                } else {
+                  const text = await invoke<string>('read_text_file', { path });
+                  file = new File([text], filename, { type: 'text/plain' });
+                }
+
+                confirmBeforeReplacing(() => importDroppedFile(file));
+              } catch (err) {
+                console.error('Failed to read dropped file:', err);
+                showToast(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`, 'error');
+              }
+            };
+            importTauriFile(filePath);
+          }
+        });
+
+        if (cancelled) {
+          unlisten();
+        } else {
+          unlistenFn = unlisten;
+        }
+      } catch (err) {
+        console.error('Failed to set up Tauri drag-drop listener:', err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
+  }, [editor, importDroppedFile]);
+
+
+
+  // ── Compare with Version picker callback ──
+  const handleCompareVersionSelect = useCallback(
+    async (version: VersionSummary) => {
+      if (!editor) return;
+      setCompareVersionOpen(false);
+      try {
+        const stored = useVersionStore.getState().versions.find((v) => v.id === version.hash);
+        if (!stored) {
+          showToast('That version is no longer in this script', 'info');
+          return;
+        }
+        const baseline = await readStoredVersion(stored);
+        setTrackChangesEnabled(true);
+        setTrackChangesLabel(version.short_hash);
+        const { tr } = editor.state;
+        tr.setMeta(trackChangesPluginKey, { enabled: true, baseline });
+        editor.view.dispatch(tr);
+      } catch {
+        showToast('Failed to load version for comparison', 'error');
+      }
+    },
+    [editor, setCompareVersionOpen, setTrackChangesEnabled, setTrackChangesLabel],
+  );
+
+  const handleCharAutoSelect = useCallback((name: string) => {
+    if (!editor) return;
+    // Replace the block text (or, for a time of day, just the part after the
+    // dash) with the pick
+    const { $from } = editor.state.selection;
+    const start = $from.start() + (charAutoState.replaceFrom ?? 0);
+    const end = $from.end();
+    editor.chain().focus()
+      .command(({ tr }) => {
+        tr.insertText(name, start, end);
+        return true;
+      })
+      .run();
+    setCharAutoState(s => ({ ...s, visible: false }));
+  }, [editor, charAutoState.replaceFrom]);
+
+  const handleCharAutoDismiss = useCallback(() => {
+    setCharAutoState(s => ({ ...s, visible: false }));
+    charAutoDismissedRef.current = true;
+  }, []);
+
+  // --- Click on script note highlight → auto-filter notes panel ---
+  // Only opens the panel when note highlights are visible (notesVisible).
+  // When highlights are off, clicks pass through as normal editing.
+  useEffect(() => {
+    if (!editor) return;
+    const handleClick = (e: MouseEvent) => {
+      const store = useEditorStore.getState();
+      // Only intercept clicks when highlights are visible
+      if (!store.notesVisible) return;
+
+      const target = e.target as HTMLElement;
+      const noteEl = target.closest('.script-note-highlight') as HTMLElement | null;
+      if (!noteEl) return;
+
+      const noteId = noteEl.getAttribute('data-note-id');
+      if (!noteId) return;
+
+      const note = store.notes.find((n) => n.id === noteId);
+      if (!note) return;
+
+      // Filter to this specific note
+      store.setNoteFilter({
+        elementType: null,
+        contextLabel: null,
+        color: null,
+        noteId: noteId,
+      });
+
+      // Open the notes panel if not already open
+      if (!store.scriptNotesOpen) store.toggleScriptNotes();
+    };
+
+    const editorEl = editor.view.dom;
+    editorEl.addEventListener('click', handleClick);
+    return () => editorEl.removeEventListener('click', handleClick);
+  }, [editor]);
+
+  // --- Click on character element → expand in character panel ---
+  useEffect(() => {
+    if (!editor) return;
+    const handleCharClick = (e: MouseEvent) => {
+      const store = useEditorStore.getState();
+      if (!store.characterProfilesOpen) return;
+
+      const pos = editor.view.posAtCoords({ left: e.clientX, top: e.clientY });
+      if (!pos) return;
+
+      const resolved = editor.state.doc.resolve(pos.pos);
+      const node = resolved.parent;
+
+      if (node.type.name === 'character') {
+        const base = characterKey(node.textContent);
+        if (base) {
+          store.setSelectedCharacter(base);
+        }
+      }
+    };
+
+    const editorEl = editor.view.dom;
+    editorEl.addEventListener('click', handleCharClick);
+    return () => editorEl.removeEventListener('click', handleCharClick);
+  }, [editor]);
+
+  // --- Script context menu (right-click) ---
+  useEffect(() => {
+    if (!editor) return;
+    const isTouchDevice = navigator.maxTouchPoints > 0;
+    const handleContextMenu = (e: MouseEvent) => {
+      const editorDom = editor.view.dom;
+      if (!editorDom.contains(e.target as Node)) return;
+      // No context menu on touch devices — three fingers opens it instead —
+      // and nothing prevented either. On a touch screen the long press that fires this
+      // event is the same gesture that selects a word and puts the selection
+      // UI on screen, so preventing it here took the selection handles with it.
+      // This used to run before the check, which meant that on a
+      // touch device the handler did nothing *but* cancel the gesture.
+      if (isTouchDevice) return;
+      e.preventDefault();
+
+      // Move cursor to click position only if no text is selected,
+      // or if the click is outside the current selection
+      const pos = editor.view.posAtCoords({ left: e.clientX, top: e.clientY });
+      if (pos) {
+        const { from, to } = editor.state.selection;
+        const clickInSelection = pos.pos >= from && pos.pos <= to && from !== to;
+        if (!clickInSelection) {
+          editor.commands.setTextSelection(pos.pos);
+        }
+      }
+
+      // Check if clicked on a misspelled word
+      let spellInfo: { word: string; from: number; to: number; suggestions: string[] } | null = null;
+      const target = e.target as HTMLElement;
+      if (target.classList.contains('spell-error') || target.closest('.spell-error')) {
+        const spellEl = target.classList.contains('spell-error') ? target : target.closest('.spell-error');
+        if (spellEl && pos) {
+          // Find the decoration range by examining the spell error text
+          const pluginState = spellCheckPluginKey.getState(editor.state) as { decorations: import('@tiptap/pm/view').DecorationSet; enabled: boolean } | undefined;
+          if (pluginState?.enabled) {
+            const decos = pluginState.decorations.find(pos.pos, pos.pos);
+            if (decos.length > 0) {
+              const deco = decos[0];
+              const word = editor.state.doc.textBetween(deco.from, deco.to);
+              spellInfo = {
+                word,
+                from: deco.from,
+                to: deco.to,
+                suggestions: spellChecker.suggest(word),
+              };
+            }
+          }
+        }
+      }
+
+      // Check if clicked on a grammar issue.
+      let grammarInfo:
+        | { from: number; to: number; ruleId: string; message: string; severity: 'style' | 'grammar'; suggestions: string[] }
+        | null = null;
+      if (pos && (target.classList.contains('grammar-issue') || target.closest('.grammar-issue'))) {
+        const ps = grammarPluginKey.getState(editor.state) as { enabled: boolean; issues: import('../plugins/registry').GrammarIssue[] } | undefined;
+        if (ps?.enabled && Array.isArray(ps.issues)) {
+          const hit = ps.issues.find((i) => pos.pos >= i.from && pos.pos <= i.to);
+          if (hit) {
+            grammarInfo = {
+              from: hit.from,
+              to: hit.to,
+              ruleId: hit.ruleId,
+              message: hit.message,
+              severity: hit.severity,
+              suggestions: hit.suggestions ?? [],
+            };
+          }
+        }
+      }
+
+      setCtxMenuState({
+        visible: true,
+        position: { x: e.clientX, y: e.clientY },
+        spellInfo,
+        grammarInfo,
+      });
+    };
+
+    // Attach to the editor's parent to catch all right-clicks in the editor area
+    const editorEl = editor.view.dom.parentElement;
+    if (editorEl) {
+      editorEl.addEventListener('contextmenu', handleContextMenu);
+      return () => editorEl.removeEventListener('contextmenu', handleContextMenu);
+    }
+  }, [editor]);
+
+  const handleCtxMenuClose = useCallback(() => {
+    setCtxMenuState(s => ({ ...s, visible: false }));
+  }, []);
+
+  // --- Spell check: open modal when toggled on (or from menu) ---
+  // The modal is opened via the Tools menu or spellCheckEnabled toggle.
+
+  const zoomScale = zoomLevel / 100;
+
+  // What each page owes at its foot. Empty whenever nothing prints, so the
+  // lookups below cost nothing in the overwhelmingly common case.
+  const footnotesByPage = useMemo(() => {
+    const map = new Map<number, FootnotePageAssignment>();
+    for (const fp of footnotePages) map.set(fp.pageNumber, fp);
+    return map;
+  }, [footnotePages]);
+
+  // Script pages, excluding the NOTES sheets those endnotes will be drawn on.
+  const scriptPageCount = Math.max(1, (hfPageCount || 1) - endnotePages.length);
+  const endnoteExtraHeight = useMemo(() => {
+    if (endnotePages.length === 0) return 0;
+    const m = getPageMetrics(pageLayout);
+    return endnotePages.length * (m.sepHeightPx + m.pageContentPx);
+  }, [endnotePages, pageLayout]);
+
+  const renderFootnotes = useCallback((pageNumber: number) => {
+    // Not gated on the document's Location: a note can be sent to the foot of
+    // its page on its own, and only the notes that actually go there reach
+    // `footnotesByPage` in the first place.
+    if (!footnotePlan) return null;
+    const owed = footnotesByPage.get(pageNumber);
+    if (!owed || owed.slices.length === 0) return null;
+    return (
+      <FootnoteBlock
+        plan={footnotePlan}
+        slices={owed.slices}
+        noteIds={owed.noteIds}
+        pageNumber={pageNumber}
+      />
+    );
+  }, [footnotePlan, footnotesByPage]);
+
+  // Compute last-page footer position so the last page shows its full extent
+  const lastPageEnd = useMemo(() => {
+    const m = getPageMetrics(pageLayout);
+    if (overlays.length > 0) {
+      const lastOverlay = overlays[overlays.length - 1];
+      return lastOverlay.top + m.sepHeightPx + m.pageContentPx;
+    }
+    // Single page: content starts after top padding
+    const topMarginPx = (pageLayout.topMargin / 72) * 96;
+    return topMarginPx + m.pageContentPx;
+  }, [overlays, pageLayout]);
+
+  // Show loading screen while collab session is being set up
+
+  return (
+    <div className="app-container">
+      {collabMode && (
+        <div className="collab-banner">
+          <span className={`collab-dot${collabConnectionState === 'disconnected' ? ' collab-dot-disconnected' : collabConnectionState === 'connecting' || collabConnectionState === 'connected' ? ' collab-dot-connecting' : ''}`} />
+          <span className="collab-banner-text">
+            Live Collaboration{collabConnectionState === 'synced' ? '' : collabConnectionState === 'disconnected' ? ' — Reconnecting\u2026' : ' — Connecting\u2026'}
+            {collabConnectionState === 'synced' && <> — {collabRole === 'viewer' ? 'Read Only' : 'Editing'} as <strong>{collabUserName}</strong></>}
+            {collabConnectionState === 'synced' && collabUsers.length > 0 && ` — ${collabUsers.length} user${collabUsers.length !== 1 ? 's' : ''} connected`}
+          </span>
+          <div className="collab-avatars">
+            {collabUsers.map((u, i) => (
+              <span
+                key={i}
+                className="collab-avatar"
+                style={{ backgroundColor: u.color, cursor: 'pointer' }}
+                title={`Click to jump to ${u.name}'s cursor`}
+                onClick={() => {
+                  // Find the collaboration cursor label matching this user and scroll to it
+                  const labels = document.querySelectorAll('.collaboration-cursor__label');
+                  for (const label of labels) {
+                    if (label.textContent === u.name) {
+                      const caret = label.closest('.collaboration-cursor__caret');
+                      if (caret) {
+                        caret.scrollIntoView({ behavior: 'auto', block: 'center' });
+                      }
+                      return;
+                    }
+                  }
+                }}
+              >
+                {u.name.charAt(0).toUpperCase()}
+              </span>
+            ))}
+          </div>
+          <div className="collab-activity-wrapper">
+            <button className="collab-banner-btn collab-activity-btn" onClick={() => setCollabActivityOpen((v) => !v)} title="Activity Log">
+              <span className="collab-activity-label">Activity</span>
+              <svg className="collab-activity-icon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            </button>
+            {collabActivityOpen && (
+              <div className="collab-activity-dropdown">
+                <div className="collab-activity-header">
+                  <strong>Activity Log</strong>
+                  <button className="collab-activity-close" onClick={() => setCollabActivityOpen(false)}>&times;</button>
+                </div>
+                <div className="collab-activity-list">
+                  {collabActivityLog.length === 0 && <div className="collab-activity-empty">No events yet</div>}
+                  {[...collabActivityLog].reverse().map((entry, i) => (
+                    <div key={i} className="collab-activity-item">
+                      <span className="collab-activity-time">{entry.time.toLocaleTimeString()}</span>
+                      <span className="collab-activity-msg">{entry.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <button className="collab-banner-btn collab-banner-btn-stop" onClick={handleStopLive}>
+            {isCollabHost ? 'End Session' : 'Disconnect'}
+          </button>
+        </div>
+      )}
+      {saveStatus === 'error' && (
+        <div className="save-failure-banner">
+          <span className="save-failure-icon">&#9888;</span>
+          <span className="save-failure-text">
+            Auto-save failed{saveError ? `: ${saveError}` : ''}. Your changes may not be saved. Press Ctrl+S to try again.
+          </span>
+          <button className="save-failure-btn" onClick={() => {
+            // Goes through downloadDCraft so the file gets the .dcraft envelope
+            // and DraftCraft can actually reopen it. The previous version wrote a
+            // bare payload via a raw anchor, which parseDCraft rejected — the
+            // emergency backup could not be imported — and which on desktop
+            // dropped silently into Downloads with no dialog.
+            const content = buildSaveContent();
+            if (!content) return;
+            const store = useEditorStore.getState();
+            const title = store.documentTitle || 'Untitled';
+            downloadDCraft(
+              {
+                id: '', title, author: '', format: 'json',
+                created_at: '', updated_at: '', page_count: store.pageCount,
+                size_bytes: 0, color: '', pinned: false, sort_order: 0, preview: '',
+              },
+              content,
+              {
+                backupKind: 'crash',
+                projectId: null,
+                scriptId: null,
+              },
+            ).then(() => showToast('Backup exported', 'success'))
+              .catch((err) => showToast(
+                `Backup export failed: ${err instanceof Error ? err.message : String(err)}`,
+                'error',
+              ));
+          }}>
+            Export Backup
+          </button>
+          <button className="save-failure-dismiss" onClick={() => setSaveStatus('unsaved')}>
+            &times;
+          </button>
+        </div>
+      )}
+      {liveDialog && (
+        <LiveSessionDialog
+          role={liveDialog}
+          begin={beginLive}
+          onConnected={finishLive}
+          onCancel={() => endLive()}
+        />
+      )}
+      <MenuBar editor={editor} onDocumentSaved={(json) => { lastSavedJsonRef.current = json; }} onLiveHost={() => setLiveDialog('host')} onLiveJoin={() => setLiveDialog('join')} onLiveEnd={handleStopLive} liveActive={liveMode} isCollabActive={collabMode} isCollabGuest={collabMode && !isCollabHost} />
+      <Toolbar editor={editor} />
+      <div className="editor-layout">
+        <SceneNavigator editor={editor} scrollContainer={editorMainRef.current} style={{ width: navWidth, minWidth: navWidth }} />
+        {navigatorOpen && (
+          <div className="panel-resize-handle" onPointerDown={(e) => handleResizePointerDown('left', e)} style={{ touchAction: 'none' }} />
+        )}
+        <div className="editor-center">
+          <IndexCards editor={editor} scrollContainer={editorMainRef.current} />
+          {statisticsOpen && editor ? (
+            <ScriptStatistics editor={editor} />
+          ) : beatBoardOpen ? (
+            <BeatBoard />
+          ) : (
+            <div className="editor-main" ref={editorMainRef} onDragOver={handleEditorDragOver} onDragLeave={handleEditorDragLeave} onDrop={handleEditorDrop}>
+              <div
+                className="page-sizer"
+                style={{
+                  width: `calc(${pageLayout.pageWidth}in * ${zoomScale})`,
+                  minWidth: `calc(${pageLayout.pageWidth}in * ${zoomScale})`,
+                }}
+              >
+              <div
+                className="page-container"
+                style={{
+                  // No transform at 1:1. WebKit does not paint the caret inside
+                  // a transformed contenteditable — selection and typing work,
+                  // the caret is simply invisible — and an identity scale is
+                  // enough to trigger it. Since scale(1) changes nothing but
+                  // costs the writer their cursor, it is left off entirely at
+                  // the default zoom, which is where nearly everyone writes.
+                  ...(zoomScale === 1
+                    ? {}
+                    : { transform: `scale(${zoomScale})` }),
+                  transformOrigin: 'top left',
+                  width: `${pageLayout.pageWidth}in`,
+                  minWidth: `${pageLayout.pageWidth}in`,
+                  maxWidth: `${pageLayout.pageWidth}in`,
+                }}
+              >
+                <div
+                  className={`page${!tagsVisible ? ' tags-hidden' : ''}${!notesVisible ? ' notes-hidden' : ''}${sceneNumbersVisible ? ' show-scene-numbers' : ''}${includeTitlePageInOutput ? '' : ' print-skip-title-page'}${showRevisionColors ? ' show-revision-colors' : ''}`}
+                  ref={pageRef}
+                  style={{
+                    fontFamily: fontStack(fontFamily),
+                    fontSize: `${fontSize}pt`,
+                    width: `${pageLayout.pageWidth}in`,
+                    minHeight: `${lastPageEnd + endnoteExtraHeight + (pageLayout.bottomMargin / 72) * 96}px`,
+                    paddingTop: `${pageLayout.topMargin}pt`,
+                    paddingBottom: `${pageLayout.bottomMargin}pt`,
+                    paddingLeft: `${pageLayout.leftMargin}in`,
+                    paddingRight: `${pageLayout.rightMargin}in`,
+                    // CSS variables for element padding calculations
+                    ...{ '--pl': `${pageLayout.leftMargin}in` } as React.CSSProperties,
+                    ...{ '--pr': `${pageLayout.rightMargin}in` } as React.CSSProperties,
+                    ...{ '--pw': `${pageLayout.pageWidth}in` } as React.CSSProperties,
+                    // The document's typeface.  .screenplay-content sets its own
+                    // font-family from --screenplay-font, so the inline
+                    // fontFamily above never reaches the script text; the
+                    // variable has to be overridden here for the page to
+                    // actually render in the font the document is set in.
+                    ...{
+                      '--screenplay-font': fontStack(fontFamily),
+                      '--screenplay-font-size': `${fontSize}pt`,
+                    } as React.CSSProperties,
+                  }}
+                >
+                  {/* Page break separators — absolutely positioned, full page width */}
+                  {overlays.map((ov) => {
+                    // `ov.pageNumber` counts script pages, ignoring the title page;
+                    // the band shows the PRINTED number, which the starting-number
+                    // offset can shift.
+                    const headerPrinted = printedPageNumber(ov.pageNumber, headerFooter.startingPageNumber);
+                    // The footer belongs to the page BEFORE this break. At the
+                    // title-page break that previous page IS the title page, which
+                    // is unnumbered and carries no header or footer.
+                    const footerPrinted = printedPageNumber(ov.pageNumber - 1, headerFooter.startingPageNumber);
+                    const showHeader = headerPrinted >= headerFooter.headerStartPage;
+                    const showFooterForPrev = !ov.isTitlePage && footerPrinted >= headerFooter.footerStartPage;
+                    return (
+                    <div
+                      key={ov.pageNumber}
+                      className="page-sep"
+                      style={{ top: `${ov.top}px` }}
+                    >
+                      <div className="page-sep-bottom" style={{ height: `${pageLayout.bottomMargin}pt`, position: 'relative' }}>
+                        {ov.isDialogueSplit && moresContds.dialogueBreakContd && (
+                          <div className="page-sep-more">{moresContds.moreText}</div>
+                        )}
+                        {showFooterForPrev && renderHFBand('footer', footerPrinted, lockedLabel(ov.pageNumber - 1))}
+                        {/* The bottom band belongs to the page above this
+                            break, which is the page whose footnotes these are —
+                            the same off-by-one `footerPrinted` accounts for. */}
+                        {!ov.isTitlePage && renderFootnotes(ov.pageNumber - 1)}
+                      </div>
+                      <div className="page-sep-gap" />
+                      <div className="page-sep-top" style={{ height: `${pageLayout.topMargin}pt` }}>
+                        {showHeader && renderHFBand('header', headerPrinted, lockedLabel(ov.pageNumber))}
+                      </div>
+                      {ov.isDialogueSplit && ov.characterName && moresContds.dialogueBreakContd && (
+                        <div className="page-sep-contd">
+                          {ov.characterName} <span style={{ textTransform: 'none' }}>{moresContds.contdText}</span>
+                        </div>
+                      )}
+
+                    </div>
+                    );
+                  })}
+
+                  {/* First script page header. Every other page's header hangs off
+                      the page break above it; page 1 has no break above it unless a
+                      title page precedes it, so without this the very first header
+                      would have nowhere to render — invisible on screen even though
+                      it printed. */}
+                  {(() => {
+                    if (overlays.some((o) => o.isTitlePage)) return null; // the title-page break carries it
+                    const printed = printedPageNumber(1, headerFooter.startingPageNumber);
+                    if (printed < headerFooter.headerStartPage) return null;
+                    return (
+                      <div className="page-sep page-sep-first" style={{ top: 0 }}>
+                        <div className="page-sep-top" style={{ height: `${pageLayout.topMargin}pt` }}>
+                          {renderHFBand('header', printed, lockedLabel(1))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Last page footer — no page break follows the last page, so render its footer separately */}
+                  {(() => {
+                    const lastPage = overlays.length > 0
+                      ? overlays[overlays.length - 1].pageNumber
+                      : 1;
+                    const printed = printedPageNumber(lastPage, headerFooter.startingPageNumber);
+                    const showFooter = printed >= headerFooter.footerStartPage;
+                    const footnotes = renderFootnotes(lastPage);
+                    // Footnotes belong to the page whether or not it carries a
+                    // footer — the two are unrelated, and a script whose footer
+                    // starts on page 2 still cites sources on page 1.
+                    if (!showFooter && !footnotes) return null;
+                    return (
+                      <div
+                        className="page-sep"
+                        style={{ top: `${lastPageEnd}px` }}
+                      >
+                        <div className="page-sep-bottom" style={{ height: `${pageLayout.bottomMargin}pt`, position: 'relative' }}>
+                          {showFooter && renderHFBand('footer', printed, lockedLabel(lastPage))}
+                          {footnotes}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {footnotePlan && endnotePages.length > 0 && (
+                    <EndnotePages
+                      plan={footnotePlan}
+                      pages={endnotePages}
+                      layout={pageLayout}
+                      lastPageEnd={lastPageEnd}
+                      scriptPageCount={scriptPageCount}
+                      renderBands={(pageNumber) => {
+                        const printed = printedPageNumber(pageNumber, headerFooter.startingPageNumber);
+                        return {
+                          header: printed >= headerFooter.headerStartPage
+                            ? renderHFBand('header', printed, lockedLabel(pageNumber)) : null,
+                          footer: printed >= headerFooter.footerStartPage
+                            ? renderHFBand('footer', printed - 1, lockedLabel(pageNumber - 1)) : null,
+                        };
+                      }}
+                    />
+                  )}
+
+                  <EditorContent editor={editor} />
+                </div>
+              </div>
+              </div>
+            </div>
+          )}
+        </div>
+        {rightPanelVisible && (
+          <div className="panel-resize-handle" onPointerDown={(e) => handleResizePointerDown('right', e)} style={{ touchAction: 'none' }} />
+        )}
+        <ScriptNotes editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />
+        <CharacterProfiles editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />
+        <TagsPanel editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />
+        <LocationDatabase editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />
+        <PluginPanelTabs
+          editor={editor}
+          width={rightPanelWidth}
+          onResizePointerDown={(e) => handleResizePointerDown('right', e)}
+        />
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+        <StatusBar editorDoc={editor?.getJSON()} />
+        {pluginRegistry.getPanels('status-bar').map((p) => (
+          <p.component key={p.id} />
+        ))}
+      </div>
+      <SearchReplace editor={editor} />
+      <GoToPage onGoToPage={handleGoToPage} />
+      <ZoomPanel />
+      {pickerState.visible && (
+        <ElementPicker
+          position={pickerState.position}
+          defaultType={pickerState.defaultType}
+          availableTypes={pickerState.availableTypes}
+          onSelect={handlePickerSelect}
+          onInsertBlankLine={pickerState.blankLine ? handlePickerInsertLine : undefined}
+          onInsertAvRow={pickerState.avCell ? handlePickerInsertAvRow : undefined}
+          onDismiss={handlePickerDismiss}
+        />
+      )}
+      {charAutoState.visible && !pickerState.visible && (
+        <CharacterAutocomplete
+          position={charAutoState.position}
+          suggestions={charAutoState.suggestions}
+          onSelect={handleCharAutoSelect}
+          onDismiss={handleCharAutoDismiss}
+        />
+      )}
+      {/* Script context menu: opened by a three-finger touch on touch screens */}
+      {ctxMenuState.visible && editor && (
+        <ScriptContextMenu
+          editor={editor}
+          position={ctxMenuState.position}
+          spellInfo={ctxMenuState.spellInfo}
+          grammarInfo={ctxMenuState.grammarInfo}
+          onClose={handleCtxMenuClose}
+          onOpenFormatPanel={() => {
+            // Block opening if element disallows all format overrides
+            if (editor) {
+              const tpl = useFormattingTemplateStore.getState().getActiveTemplate();
+              if (tpl.mode === 'enforce') {
+                const rule = getCurrentElementRule(editor, tpl);
+                if (rule && !rule.allowFormatOverride) return;
+              }
+            }
+            setFormatPanelOpen(true);
+          }}
+          overrideSelection={ctxMenuState.savedSelection}
+        />
+      )}
+      {formatPanelOpen && editor && (
+        <FormatPanel editor={editor} onClose={() => setFormatPanelOpen(false)} />
+      )}
+      {spellModalOpen && editor && (
+        <SpellCheckModal
+          editor={editor}
+          onClose={() => setSpellModalOpen(false)}
+        />
+      )}
+      {grammarModalOpen && editor && (
+        <WritingSuggestionsModal
+          editor={editor}
+          onClose={() => setGrammarModalOpen(false)}
+        />
+      )}
+      {grammarRulesPanelOpen && (
+        <GrammarRulesPanel onClose={() => setGrammarRulesPanelOpen(false)} />
+      )}
+      <VersionHistory editor={editor} />
+      <AssetManager />
+      {showWelcome && !recoveryPending && <WelcomeDialog onChoice={handleWelcomeChoice} />}
+      {/* After the recovery prompt, never alongside it — two launch dialogs at
+          once is what #68 warned about. */}
+      {!collabMode && sceneSpacingPrompt
+        && !recoveryPending && !recoveryPromptOpen && (
+        <SceneSpacingPromptDialog onAnswer={handleSceneSpacingAnswer} />
+      )}
+      {!collabMode && (
+        <RecoveryPromptDialog
+          editorReady={!!editor}
+          onRestore={handleRecoveryRestore}
+          onOpenChange={handleRecoveryOpenChange}
+          onChecked={handleRecoveryChecked}
+        />
+      )}
+      {openElsewhere && (
+        <DocumentOpenElsewhereDialog
+          other={openElsewhere}
+          documentTitle={openElsewhereTitle || backupDocumentTitle}
+          onSwitch={switchToOtherWindow}
+          onOpenAnyway={openDuplicateAnyway}
+        />
+      )}
+      {compareVersionOpen && (
+        <CompareVersionPicker
+          onSelect={handleCompareVersionSelect}
+          onClose={() => setCompareVersionOpen(false)}
+        />
+      )}
+      {titlePageEditorOpen && editor && (
+        <TitlePageEditor
+          editor={editor}
+          onClose={() => setTitlePageEditorOpen(false)}
+        />
+      )}
+      {fontsDialogOpen && (
+        <FontsDialog onClose={() => setFontsDialogOpen(false)} />
+      )}
+
+      {moresContdsOpen && (
+        <MoresContdsDialog onClose={() => setMoresContdsOpen(false)} />
+      )}
+      {footnoteDialogOpen && (
+        <FootnoteDialog onClose={() => setFootnoteDialogOpen(false)} />
+      )}
+      {headerFooterOpen && (
+        <HeaderFooterDialog
+          focusBand={headerFooterFocus}
+          // Clear the focus hint on the way out: the menu opens this dialog
+          // without one, and a stale band would steal the caret next time.
+          onClose={() => { setHeaderFooterOpen(false); setHeaderFooterFocus(undefined); }}
+        />
+      )}
+      <input
+        ref={imageFileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleImageFileChange}
+      />
+      {dragOverEditor && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'rgba(37,99,235,.15)',
+          border: '3px dashed var(--fd-accent, #2563eb)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            background: 'var(--fd-bg)', padding: '20px 32px', borderRadius: 12,
+            boxShadow: '0 8px 32px rgba(0,0,0,.3)', fontSize: 16, fontWeight: 600,
+            color: 'var(--fd-text)',
+          }}>
+            Drop screenplay file to open
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default ScreenplayEditor;

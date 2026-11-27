@@ -1,0 +1,211 @@
+import { resolveMoresContds } from '../stores/editorStore';
+import type { PageLayout } from '../stores/editorStore';
+
+/**
+ * Carrying an opened .fdx's unmodelled sections through a save.
+ *
+ * exportFDX writes the sections DraftCraft understands. A Final Draft file
+ * has many more (Macros, Cast, SmartType, Outlines, ScriptNotes, ...). They are
+ * captured, untouched, when the file is opened, kept with the document, and
+ * written back on save for every section the export did not write itself, so a
+ * round trip loses nothing that the app does not edit.
+ */
+export interface FdxRaw {
+  /** The file's own root `Version` attribute. */
+  version: string;
+  /** Top-level section tag -> its XML, exactly as the file had it. */
+  sections: Record<string, string>;
+  /**
+   * The original XML of the sections DraftCraft writes from its own settings
+   * (page layout, header and footer, element settings, cast list), and the
+   * fingerprint of the settings they were read into. While the settings still
+   * match it, the file's own sections go back as they were.
+   */
+  settings?: Record<string, string>;
+  sig?: SettingsSignature;
+}
+
+export interface SettingsSignature {
+  layout: string;
+  cast: string;
+}
+
+/** Sections exportFDX always writes itself, so the original is never needed. */
+const WRITTEN_BY_EXPORTER = new Set(['Content', 'PageLayout', 'ElementSettings', 'HeaderAndFooter', 'TitlePage']);
+
+/** The sections written from the app's settings, whose originals are kept beside them. */
+const SETTINGS_SECTIONS = new Set(['PageLayout', 'HeaderAndFooter', 'ElementSettings', 'CastList']);
+
+export function isFdxRaw(v: unknown): v is FdxRaw {
+  if (!v || typeof v !== 'object') return false;
+  const s = (v as { sections?: unknown }).sections;
+  return !!s && typeof s === 'object';
+}
+
+export function captureFdxRaw(xml: string): FdxRaw | null {
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    const root = doc.documentElement;
+    if (!root || root.nodeName !== 'FinalDraft' || doc.querySelector('parsererror')) return null;
+    const ser = new XMLSerializer();
+    const sections: Record<string, string> = {};
+    for (const child of Array.from(root.children)) {
+      if (WRITTEN_BY_EXPORTER.has(child.tagName) || child.tagName in sections) continue;
+      sections[child.tagName] = ser.serializeToString(child);
+    }
+    const settings: Record<string, string> = {};
+    for (const child of Array.from(root.children)) {
+      if (!SETTINGS_SECTIONS.has(child.tagName)) continue;
+      const s = ser.serializeToString(child);
+      settings[child.tagName] = child.tagName in settings ? `${settings[child.tagName]}\n  ${s}` : s;
+    }
+    return { version: root.getAttribute('Version') ?? '', sections, settings };
+  } catch (err) {
+    console.warn('[fdx] could not keep the original sections', err);
+    return null;
+  }
+}
+
+/** Add every remembered section the freshly exported XML does not already have. */
+export function mergeFdxRaw(xml: string, raw: FdxRaw | null | undefined, current?: SettingsSignature): string {
+  if (!raw || !raw.sections) return xml;
+  xml = keepOriginalSettings(xml, raw, current);
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    if (doc.querySelector('parsererror')) return xml;
+    const present = new Set(Array.from(doc.documentElement.children).map((c) => c.tagName));
+    const missing = Object.entries(raw.sections).filter(([tag]) => !present.has(tag));
+    if (missing.length === 0) return xml;
+    const close = xml.lastIndexOf('</FinalDraft>');
+    if (close < 0) return xml;
+    const block = missing.map(([, s]) => '  ' + s).join('\n\n');
+    let out = xml.slice(0, close) + '\n' + block + '\n' + xml.slice(close);
+    if (raw.version) out = out.replace(/^(<FinalDraft[^>]*\sVersion=")[^"]*(")/m, '$1' + raw.version + '$2');
+    return out;
+  } catch (err) {
+    console.warn('[fdx] could not add the original sections back', err);
+    return xml;
+  }
+}
+
+/** The automatic character-continued marker in force, or '' when that setting is off. */
+export function autoContdMarker(layout: PageLayout | undefined): string {
+  const mc = resolveMoresContds(layout);
+  return mc.characterContd ? (mc.contdText.trim() || "(CONT'D)") : '';
+}
+
+/** A character cue without the trailing automatic continued marker. */
+export function stripAutoContd(text: string, marker: string): string {
+  if (!marker) return text;
+  const re = new RegExp('\\s*' + marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'i');
+  return text.replace(re, '');
+}
+
+const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/**
+ * The `<SceneProperties>` block for a scene heading. The original block (arc
+ * beats, page, length) is written back as it was; only the synopsis, which the
+ * app lets the writer edit, is patched in. Without an original it is just the
+ * synopsis, or nothing when there is none.
+ */
+export function sceneProperties(raw: unknown, synopsis: unknown, indent: string): string {
+  const syn = typeof synopsis === 'string' ? synopsis.trim() : '';
+  if (typeof raw === 'string' && raw) {
+    try {
+      const doc = new DOMParser().parseFromString(raw, 'text/xml');
+      const sp = doc.documentElement;
+      if (!doc.querySelector('parsererror') && sp.tagName === 'SceneProperties') {
+        const summary = Array.from(sp.children).find((c) => c.tagName === 'Summary');
+        const current = (summary?.textContent ?? '').trim();
+        if (current !== syn) {
+          if (!syn) {
+            summary?.remove();
+          } else {
+            let target = summary;
+            if (!target) {
+              target = doc.createElement('Summary');
+              sp.insertBefore(target, sp.firstChild);
+            }
+            target.textContent = '';
+            const p = doc.createElement('Paragraph');
+            const t = doc.createElement('Text');
+            t.textContent = syn;
+            p.appendChild(t);
+            target.appendChild(p);
+          }
+        }
+        return indent + new XMLSerializer().serializeToString(sp);
+      }
+    } catch (err) {
+      console.warn('[fdx] could not reuse the original scene properties', err);
+    }
+  }
+  if (!syn) return '';
+  return [
+    indent + '<SceneProperties>',
+    indent + '  <Summary>',
+    indent + '    <Paragraph>',
+    indent + '      <Text>' + xmlEsc(syn) + '</Text>',
+    indent + '    </Paragraph>',
+    indent + '  </Summary>',
+    indent + '</SceneProperties>',
+  ].join('\n');
+}
+
+/**
+ * What a free-form title page line says and how it is set: its alignment, its
+ * text and which marks each run carries. Taken when a file is opened and again
+ * at save, so a line left alone can be written back as the file had it and a
+ * line that was edited is written from what is on screen.
+ */
+export function titleLineSignature(
+  align: unknown,
+  content: ReadonlyArray<{ type?: string; text?: string; marks?: ReadonlyArray<{ type: string }> }> | undefined,
+): string {
+  const runs = (content ?? []).map((c) => (
+    c.type === 'hardBreak'
+      ? ['\n']
+      : [c.text ?? '', ...(c.marks ?? []).map((m) => m.type).sort()]
+  ));
+  return JSON.stringify([typeof align === 'string' ? align : '', runs]);
+}
+
+/** What the settings sections are written from: page layout and font, and the cast descriptions. */
+export function settingsSignature(
+  pageLayout: unknown,
+  font: { family?: string; size?: unknown } | undefined,
+  profiles: ReadonlyArray<Partial<Record<
+    'name' | 'description' | 'gender' | 'age' | 'role' | 'backstory' | 'arc' | 'speechPattern' | 'vocabulary' | 'verbalTics' | 'sampleDialogue',
+    string
+  >>> | undefined,
+): SettingsSignature {
+  return {
+    layout: JSON.stringify([pageLayout ?? null, font?.family ?? '', Number(font?.size) || 0]),
+    // Everything folded into the cast description counts, or an edit to a backstory would be skipped.
+    cast: JSON.stringify((profiles ?? []).map((p) => [
+      p.name ?? '', p.description ?? '', p.gender ?? '', p.age ?? '', p.role ?? '', p.backstory ?? '',
+      p.arc ?? '', p.speechPattern ?? '', p.vocabulary ?? '', p.verbalTics ?? '', p.sampleDialogue ?? '',
+    ])),
+  };
+}
+
+/**
+ * Put the file's own settings sections in place of the generated ones, for
+ * every group of settings that has not changed since the file was opened.
+ */
+function keepOriginalSettings(xml: string, raw: FdxRaw, current?: SettingsSignature): string {
+  if (!raw.settings || !raw.sig || !current) return xml;
+  const swap = (out: string, re: RegExp, tag: string): string => {
+    const original = raw.settings?.[tag];
+    return original && re.test(out) ? out.replace(re, () => '\n  ' + original) : out;
+  };
+  let out = xml;
+  if (raw.sig.layout === current.layout) {
+    out = swap(out, /\n  <PageLayout[\s\S]*?<\/PageLayout>/, 'PageLayout');
+    out = swap(out, /\n+  <ElementSettings[\s\S]*<\/ElementSettings>/, 'ElementSettings');
+    out = swap(out, /\n  <HeaderAndFooter[\s\S]*?<\/HeaderAndFooter>/, 'HeaderAndFooter');
+  }
+  if (raw.sig.cast === current.cast) out = swap(out, /\n  <CastList>[\s\S]*?<\/CastList>/, 'CastList');
+  return out;
+}

@@ -1,0 +1,871 @@
+// Final Draft XML (.fdx) exporter — full formatting & layout support
+import { foldCastDescription } from './castNotes';
+import { locationNoteTexts } from './locationNotes';
+import type { JSONContent } from '@tiptap/react';
+import type { CharacterProfile, TagCategory, TagItem, BeatInfo, BeatColumn, PageLayout } from '../stores/editorStore';
+import { resolveHeaderFooter } from '../stores/editorStore';
+import { CUSTOM_TYPE_TO_FDX } from './fdxParser';
+import { jsonBlockText } from './nodeText';
+import { sanitizeExportFilename } from './exportFilename';
+import { isNonPrintingType } from './nonPrinting';
+import { noteBlockText } from './noteContent';
+import type { FootnotePlan } from './footnotes';
+import { DEFAULT_TITLE_PAGE_CREDIT } from './titlePageBlocks';
+import { titlePageAttrsCarryData } from './titlePageRegion';
+import {
+  REVISION_COLORS, findRevisionColor, revisionMarkFor, type RevisionSettings,
+} from '../editor/revisionColors';
+import { toBlackAndWhiteFdx } from './fdxBlackAndWhite';
+
+const NODE_TO_FDX: Record<string, string> = {
+  sceneHeading: 'Scene Heading',
+  action: 'Action',
+  character: 'Character',
+  dialogue: 'Dialogue',
+  parenthetical: 'Parenthetical',
+  transition: 'Transition',
+  general: 'General',
+  shot: 'Shot',
+  newAct: 'New Act',
+  endOfAct: 'End of Act',
+  lyrics: 'Lyrics',
+  showEpisode: 'Show/Episode',
+  castList: 'Cast List',
+};
+
+/** Resolve the FDX paragraph Type for a Tiptap node.
+ *  customElement nodes use their customTypeId to look up an FDX-equivalent name. */
+function resolveFdxExportType(node: JSONContent): string {
+  if (node.type === 'customElement') {
+    const cid = (node.attrs as { customTypeId?: string } | undefined)?.customTypeId;
+    if (cid && CUSTOM_TYPE_TO_FDX[cid]) return CUSTOM_TYPE_TO_FDX[cid];
+    return 'General';
+  }
+  return NODE_TO_FDX[node.type || ''] || 'General';
+}
+
+const ALIGNMENT_TO_FDX: Record<string, string> = {
+  left: 'Left', center: 'Center', right: 'Right', justify: 'Justify',
+};
+
+function esc(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;')
+    // A newline inside <Text> is how an in-paragraph line break is carried.
+    // Encoding it as a numeric entity keeps it intact through XML
+    // pretty-printers and whitespace-normalizing readers, which would
+    // otherwise collapse a raw newline to a space and lose the break.
+    .replace(/\r\n?|\n/g, '&#10;');
+}
+
+/**
+ * Build the `<HeaderAndFooter>` block from the document's own settings.
+ *
+ * Final Draft carries the dynamic fields as `<DynamicLabel>` elements rather
+ * than literal text, so a template is split on the tokens DraftCraft shares with
+ * it; `{revision}` is Final Draft's "Collated Revisions" label.
+ */
+const FDX_DYNAMIC_LABEL: Record<string, string> = {
+  '{page}': 'Page #',
+  '{pages}': 'Last Page #',
+  '{title}': 'Title',
+  '{date}': 'Date',
+  '{revision}': 'Collated Revisions',
+};
+
+function buildHFParagraph(
+  template: string,
+  alignment: 'Left' | 'Center' | 'Right',
+  docFont: string,
+  docFontSize: string,
+): string[] {
+  if (!template) return [];
+  const out: string[] = [];
+  out.push(`      <Paragraph Alignment="${alignment}" FirstIndent="0.00" Leading="Regular" LeftIndent="1.25" RightIndent="-1.00" SpaceBefore="0" Spacing="1" StartsNewPage="No">`);
+  const textRun = (s: string) => {
+    if (!s) return;
+    out.push(`        <Text AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(docFont)}" RevisionID="0" Size="${esc(docFontSize)}" Style="">${esc(s)}</Text>`);
+  };
+  const tokenRe = /(\{page\}|\{pages\}|\{title\}|\{date\}|\{revision\})/gi;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(template)) !== null) {
+    textRun(template.slice(last, m.index));
+    const label = FDX_DYNAMIC_LABEL[m[0].toLowerCase()];
+    if (label) out.push(`        <DynamicLabel Type="${label}"/>`);
+    last = tokenRe.lastIndex;
+  }
+  textRun(template.slice(last));
+  out.push('      </Paragraph>');
+  return out;
+}
+
+function buildHeaderAndFooter(
+  pageLayout: PageLayout | undefined,
+  docFont: string,
+  docFontSize: string,
+): string[] {
+  const hf = resolveHeaderFooter(pageLayout);
+  const hasContent = (c: { left: string; center: string; right: string }) =>
+    !!(c.left || c.center || c.right);
+  const headerVisible = hasContent(hf.headerContent);
+  const footerVisible = hasContent(hf.footerContent);
+  // Final Draft's first-page flags are relative to the printed number the
+  // script's opening page carries, the same comparison every DraftCraft
+  // consumer makes.
+  const first = hf.startingPageNumber;
+  const yn = (b: boolean) => (b ? 'Yes' : 'No');
+
+  const out: string[] = [];
+  out.push(
+    `  <HeaderAndFooter FooterFirstPage="${yn(hf.footerStartPage <= first)}"`
+    + ` FooterVisible="${yn(footerVisible)}"`
+    + ` HeaderFirstPage="${yn(hf.headerStartPage <= first)}"`
+    + ` HeaderVisible="${yn(headerVisible)}"`
+    + ` StartingPage="${hf.startingPageNumber}">`,
+  );
+  if (headerVisible) {
+    out.push('    <Header>');
+    out.push(...buildHFParagraph(hf.headerContent.left, 'Left', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.headerContent.center, 'Center', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.headerContent.right, 'Right', docFont, docFontSize));
+    out.push('    </Header>');
+  }
+  if (footerVisible) {
+    out.push('    <Footer>');
+    out.push(...buildHFParagraph(hf.footerContent.left, 'Left', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.footerContent.center, 'Center', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.footerContent.right, 'Right', docFont, docFontSize));
+    out.push('    </Footer>');
+  }
+  out.push('  </HeaderAndFooter>');
+  return out;
+}
+
+/** Strip HTML tags to plain text (for FDX export — CastMember Description is plain text only) */
+function stripHtml(html: string): string {
+  if (!html) return '';
+  return html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Generate ElementSettings using the document's actual margins and typeface.
+ * FDX indents are absolute positions (inches from left page edge).
+ * We shift all element indents relative to the Action baseline.
+ *
+ * The font goes on every element's FontSpec, which is where Final Draft keeps
+ * a script's typeface — writing it only on the runs would leave the file
+ * claiming Courier while its text says otherwise.
+ */
+function buildElementSettings(lm: number, ri: number, font: string, size: string): string {
+  // lm = left margin (Action LeftIndent), ri = Action RightIndent
+  const f = (n: number) => n.toFixed(2);
+  // Offsets from the standard Action indent (1.25/7.25) for each element type
+  const character_l = lm + 2.50, parenthetical_l = lm + 2.00, dialogue_l = lm + 1.31;
+  const transition_l = lm + 4.00, castList_l = lm + 0.25, outline2_l = lm + 0.50;
+  const dialogue_r = ri - 1.00, parenthetical_r = ri - 2.00, transition_r = ri - 0.50;
+  const castList_r = ri + 0.25;
+
+  return `
+  <ElementSettings Type="Scene Heading">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="AllCaps"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="24" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Scene Heading" ReturnKey="Action" Shortcut="1"/>
+  </ElementSettings>
+  <ElementSettings Type="Action">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style=""/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Action" Shortcut="2"/>
+  </ElementSettings>
+  <ElementSettings Type="Character">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="AllCaps"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(character_l)}" RightIndent="${f(ri)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Character" ReturnKey="Dialogue" Shortcut="3"/>
+  </ElementSettings>
+  <ElementSettings Type="Parenthetical">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style=""/>
+    <ParagraphSpec Alignment="Left" FirstIndent="-0.10" Leading="Regular" LeftIndent="${f(parenthetical_l)}" RightIndent="${f(parenthetical_r)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Parenthetical" ReturnKey="Dialogue" Shortcut="4"/>
+  </ElementSettings>
+  <ElementSettings Type="Dialogue">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style=""/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(dialogue_l)}" RightIndent="${f(dialogue_r)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Dialogue" ReturnKey="Action" Shortcut="5"/>
+  </ElementSettings>
+  <ElementSettings Type="Transition">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="AllCaps"/>
+    <ParagraphSpec Alignment="Right" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(transition_l)}" RightIndent="${f(transition_r)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Transition" ReturnKey="Scene Heading" Shortcut="6"/>
+  </ElementSettings>
+  <ElementSettings Type="Shot">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="AllCaps"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Scene Heading" ReturnKey="Action" Shortcut="7"/>
+  </ElementSettings>
+  <ElementSettings Type="General">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style=""/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="General" ReturnKey="General" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="Cast List">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="AllCaps"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(castList_l)}" RightIndent="${f(castList_r)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Action" Shortcut="8"/>
+  </ElementSettings>
+  <ElementSettings Type="Lyrics">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Italic"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(dialogue_l)}" RightIndent="${f(dialogue_r)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Dialogue" ReturnKey="Action" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="New Act">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Bold+Underline+AllCaps"/>
+    <ParagraphSpec Alignment="Center" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="24" Spacing="1" StartsNewPage="Yes"/>
+    <Behavior PaginateAs="Action" ReturnKey="Scene Heading" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="End of Act">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Bold+AllCaps"/>
+    <ParagraphSpec Alignment="Center" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="24" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="New Act" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="Show/Episode">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Bold+AllCaps"/>
+    <ParagraphSpec Alignment="Center" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Action" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="Outline 1">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Bold+AllCaps"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="24" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Outline Body" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="Outline 2">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style="Bold"/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(outline2_l)}" RightIndent="${f(ri)}" SpaceBefore="12" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Outline Body" Shortcut="0"/>
+  </ElementSettings>
+  <ElementSettings Type="Outline Body">
+    <FontSpec AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(font)}" RevisionID="0" Size="${esc(size)}" Style=""/>
+    <ParagraphSpec Alignment="Left" FirstIndent="0.00" Leading="Regular" LeftIndent="${f(lm)}" RightIndent="${f(ri)}" SpaceBefore="0" Spacing="1" StartsNewPage="No"/>
+    <Behavior PaginateAs="Action" ReturnKey="Action" Shortcut="0"/>
+  </ElementSettings>`;
+}
+
+interface MarkInfo { type: string; attrs?: Record<string, unknown>; }
+
+/**
+ * Final Draft numbers revisions; a run's RevisionID points into the file's
+ * `<Revisions>` list. DraftCraft numbers them by the colour's place in the
+ * production sequence, so the same colour is the same ID in every file.
+ */
+function fdxRevisionId(color: string): number {
+  const i = REVISION_COLORS.findIndex((c) => c.name === findRevisionColor(color)?.name);
+  return i < 0 ? 1 : i + 1;
+}
+
+/** Every revision colour a document's text or blocks carry. */
+function collectRevisionColors(node: JSONContent, out: Set<string> = new Set()): Set<string> {
+  if (typeof node.attrs?.revised === 'string' && node.attrs.revised) out.add(node.attrs.revised);
+  for (const mark of node.marks ?? []) {
+    if (mark.type === 'textStyle' && mark.attrs?.revision) out.add(String(mark.attrs.revision));
+  }
+  for (const child of node.content ?? []) collectRevisionColors(child, out);
+  return out;
+}
+
+/** Revision Mode's state at export, for the `<Revisions>` block. */
+export interface FDXExportOptions {
+  /** False leaves scene numbers out, as hiding them did before they could be
+   *  locked. Absent writes whatever numbers the scenes carry. */
+  sceneNumbersVisible?: boolean;
+  /** Every font colour black and every background white, for a plain copy. */
+  blackAndWhite?: boolean;
+  /** The script's locations, as saved. Each one with details goes out as a
+   *  Script Note, which Final Draft shows as text and DraftCraft reads back. */
+  locations?: unknown;
+}
+
+export interface FDXRevisionState {
+  mode: boolean;
+  color: string;
+  /** The marks to write for each revision; absent writes an asterisk. */
+  settings?: RevisionSettings | null;
+}
+
+function buildRevisions(doc: JSONContent, state?: FDXRevisionState): string[] {
+  const used = collectRevisionColors(doc);
+  if (state?.mode) used.add(state.color);
+  if (used.size === 0) return [];
+  const listed = REVISION_COLORS.filter((c) => [...used].some((u) => findRevisionColor(u)?.name === c.name));
+  // The active set has to be one the file defines: the current colour when
+  // it is listed, otherwise the latest round that is.
+  const current = state?.color ? findRevisionColor(state.color)?.name : undefined;
+  const active = current && listed.some((c) => c.name === current)
+    ? fdxRevisionId(current)
+    : fdxRevisionId(listed[listed.length - 1]?.name ?? 'White');
+  const out = [
+    '',
+    `  <Revisions ActiveSet="${active}" Location="7.75" RevisionMode="${state?.mode ? 'Yes' : 'No'}" RevisionsShown="Active" ShowAllMarks="Yes" ShowAllSets="Yes" ShowPageColor="No">`,
+  ];
+  for (const c of listed) {
+    out.push(`    <Revision Color="#000000000000" FullRevision="No" ID="${fdxRevisionId(c.name)}" Mark="${esc(revisionMarkFor(state?.settings, c.name))}" Name="${esc(c.name)} Revision" PageColor="${c.fdx}" Style=""/>`);
+  }
+  out.push('  </Revisions>');
+  return out;
+}
+
+/** #RRGGBB as Final Draft writes it: 16 bits a channel, each byte doubled. */
+function fdx48(color: string): string {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
+  return m ? `#${m[1]}${m[1]}${m[2]}${m[2]}${m[3]}${m[3]}`.toUpperCase() : color;
+}
+
+function getTextAttributes(marks?: MarkInfo[], blockRevision?: string): string {
+  const parts: string[] = [];
+  let revision = blockRevision;
+  for (const mark of marks ?? []) {
+    if (mark.type === 'textStyle' && mark.attrs?.revision) revision = String(mark.attrs.revision);
+  }
+  if (revision) parts.push(`RevisionID="${fdxRevisionId(revision)}"`);
+  if (!marks || marks.length === 0) {
+    return parts.length > 0 ? ' ' + parts.join(' ') : '';
+  }
+  const styles: string[] = [];
+  let fontName = '', fontSize = '', fontColor = '', adornment = '', explicitBlack = false;
+
+  for (const mark of marks) {
+    if (mark.type === 'bold') styles.push('Bold');
+    if (mark.type === 'italic') styles.push('Italic');
+    if (mark.type === 'underline') styles.push('Underline');
+    if (mark.type === 'fdxAdornment') {
+      if (mark.attrs?.style) adornment = String(mark.attrs.style);
+      if (mark.attrs?.black) explicitBlack = true;
+    }
+    if (mark.type === 'textStyle' && mark.attrs) {
+      if (mark.attrs.fontFamily) fontName = String(mark.attrs.fontFamily);
+      if (mark.attrs.fontSize) fontSize = String(mark.attrs.fontSize).replace('pt', '');
+      if (mark.attrs.color) fontColor = String(mark.attrs.color);
+    }
+  }
+
+  if (styles.length > 0) parts.push(`Style="${styles.join('+')}"`);
+  if (fontName) parts.push(`Font="${esc(fontName)}"`);
+  if (fontSize) parts.push(`Size="${esc(fontSize)}"`);
+  if (adornment) parts.push(`AdornmentStyle="${esc(adornment)}"`);
+  if (fontColor || explicitBlack) parts.push(`Color="${esc(fdx48(fontColor || '#000000'))}"`);
+
+  return parts.length > 0 ? ' ' + parts.join(' ') : '';
+}
+
+import { autoContdMarker, stripAutoContd, sceneProperties, titleLineSignature, mergeFdxRaw, settingsSignature, type FdxRaw } from './fdxPreserve';
+
+/**
+ * A title page opened from a Final Draft file, written back line for line.
+ *
+ * Final Draft's title page is free text, so each line is its own paragraph. A
+ * line left as it was opened goes back as the file had it, byte for byte; a
+ * line that was edited is written from what is on screen, so no edit is lost.
+ */
+/**
+ * The opening tag for an edited title-page paragraph: the file's own paragraph
+ * settings (indents, leading, spacing, outline level) are kept, and only the
+ * alignment follows what is on the page now.
+ */
+function freeParagraphOpen(raw: string, align: string): string {
+  const attrs: string[] = [];
+  let hasAlign = false;
+  const m = /^<Paragraph\b([^>]*?)\/?>/.exec(raw);
+  if (m) {
+    const re = /([A-Za-z_:][\w:.-]*)="([^"]*)"/g;
+    let x: RegExpExecArray | null;
+    while ((x = re.exec(m[1])) !== null) {
+      if (x[1] === 'Alignment') { attrs.push(`Alignment="${align}"`); hasAlign = true; }
+      else attrs.push(`${x[1]}="${x[2]}"`);
+    }
+  }
+  if (!hasAlign) attrs.unshift(`Alignment="${align}"`);
+  return `<Paragraph ${attrs.join(' ')}>`;
+}
+
+function buildFreeTitlePage(nodes: JSONContent[]): string[] {
+  const first = nodes[0]?.attrs ?? {};
+  const out: string[] = ['  <TitlePage>'];
+  if (typeof first.fdxTitleBefore === 'string' && first.fdxTitleBefore) out.push(`    ${first.fdxTitleBefore}`);
+  out.push('    <Content>');
+  for (const node of nodes) {
+    const a = node.attrs ?? {};
+    const raw = typeof a.fdxXml === 'string' ? a.fdxXml : '';
+    if (raw && a.fdxSig === titleLineSignature(a.align, node.content)) {
+      out.push(`      ${raw}`);
+      continue;
+    }
+    const align = a.align === 'center' ? 'Center' : a.align === 'right' ? 'Right' : a.align === 'justify' ? 'Full' : 'Left';
+    out.push(`      ${freeParagraphOpen(raw, align)}`);
+    let wrote = false;
+    for (const child of node.content ?? []) {
+      if (child.type === 'hardBreak') {
+        out.push('        <Text>&#10;</Text>');
+        wrote = true;
+      } else if (child.type === 'text' && child.text) {
+        out.push(`        <Text${getTextAttributes(child.marks as MarkInfo[] | undefined)}>${esc(child.text)}</Text>`);
+        wrote = true;
+      }
+    }
+    if (!wrote) out.push('        <Text></Text>');
+    out.push('      </Paragraph>');
+  }
+  out.push('    </Content>');
+  if (typeof first.fdxTitleAfter === 'string' && first.fdxTitleAfter) out.push(`    ${first.fdxTitleAfter}`);
+  out.push('  </TitlePage>');
+  return out;
+}
+
+/** The typeface a script is written in, for the element settings. */
+export interface FDXDocumentFont {
+  family?: string;
+  size?: number;
+}
+
+/**
+ * `_title` is the document's name, and deliberately unused: it used to be the
+ * fallback title on the exported title page, which is exactly the bug that was
+ * reported. It stays in the signature because every argument after it is
+ * positional, and `downloadFDX` still names the file after it.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- see above
+export function exportFDX(doc: JSONContent, _title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont, footnotes?: FootnotePlan | null, revisions?: FDXRevisionState, options: FDXExportOptions = {}): string {
+  // Printing notes reach a file only when the writer asked them to.
+  const plan = footnotes && footnotes.settings.includeInExports ? footnotes : null;
+  // Final Draft keeps the typeface on each element's FontSpec; the screenplay
+  // Courier is the default a file gets when the writer has not changed it.
+  const docFont = documentFont?.family || 'Courier Final Draft';
+  const docFontSize = String(documentFont?.size ?? 12);
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8" standalone="no" ?>');
+  lines.push('<FinalDraft DocumentType="Script" Template="No" Version="5">');
+  lines.push('');
+
+  // Page layout — use the editor's current layout for lossless round-trip
+  const pw = pageLayout?.pageWidth?.toFixed(2) ?? '8.50';
+  const ph = pageLayout?.pageHeight?.toFixed(2) ?? '11.00';
+  const tm = pageLayout?.topMargin ?? 90;
+  const bm = pageLayout?.bottomMargin ?? 62;
+  const hm = pageLayout?.headerMargin ?? 36;
+  const fm = pageLayout?.footerMargin ?? 36;
+  lines.push(`  <PageLayout BackgroundColor="#FFFFFFFFFFFF" BottomMargin="${bm}" BreakDialogueAndActionAtSentences="Yes" DocumentLeading="Normal" FooterMargin="${fm}" ForegroundColor="#000000000000" HeaderMargin="${hm}" InvisiblesColor="#808080808080" TopMargin="${tm}" UsesSmartQuotes="No">`);
+  lines.push(`    <PageSize Height="${ph}" Width="${pw}"/>`);
+  lines.push('  </PageLayout>');
+  lines.push('');
+
+  // Element settings — use actual margins so re-import round-trips correctly
+  const leftIndent = pageLayout?.leftMargin ?? 1.25;
+  const rightIndent = pageLayout ? (pageLayout.pageWidth - pageLayout.rightMargin) : 7.25;
+  lines.push(buildElementSettings(leftIndent, rightIndent, docFont, docFontSize));
+  lines.push('');
+
+  // Header and footer — the document's own settings, not a fixed page number.
+  // Final Draft models each band as aligned paragraphs plus attributes for
+  // first-page visibility and the starting number, which is close enough to
+  // DraftCraft's model to carry across without loss.
+  lines.push(...buildHeaderAndFooter(pageLayout, docFont, docFontSize));
+  lines.push('');
+
+  // Title page — the structured fields live on the one `field: 'title'` node.
+  //
+  // Whether there is a title page at all is `titlePageAttrsCarryData`, the test
+  // the paginator, the PDF exporter and the DOCX exporter already share. This
+  // asked for a non-empty `tpTitle` instead, and — worse — fell back to the
+  // *document* title when it found none, writing `<TitlePage>` unconditionally.
+  // A script that had never had a title page therefore exported one reading
+  // "Untitled Screenplay", and reopening that .fdx read the name straight back
+  // in as a title page the writer never wrote. The same test also
+  // left a title page carrying a credit but no title contributing nothing.
+  //
+  // The element itself always ships — Final Draft expects it — but an untouched
+  // title page now ships empty, which is what "preserve it as-is" means for a
+  // blank one. `title` stays in the signature: `downloadFDX` still names the
+  // file after it, and the argument is positional.
+  const titleStart = lines.length;
+  lines.push('  <TitlePage>');
+  lines.push('    <Content>');
+  let tpTitle = '';
+  let tpCredit = DEFAULT_TITLE_PAGE_CREDIT;
+  let tpWrittenBy = '';
+  let tpBasedOn = '';
+  let tpDraft = '';
+  let tpContact = '';
+  let tpCopyright = '';
+  let tpWgaRegistration = '';
+  let tpNotes = '';
+  if (doc.content) {
+    for (const node of doc.content) {
+      if (node.type === 'titlePage'
+          && titlePageAttrsCarryData(node.attrs as Record<string, unknown> | undefined)) {
+        const attrs = node.attrs ?? {};
+        tpTitle = attrs.tpTitle || '';
+        tpCredit = attrs.tpCredit || DEFAULT_TITLE_PAGE_CREDIT;
+        tpWrittenBy = attrs.tpWrittenBy || '';
+        tpBasedOn = attrs.tpBasedOn || '';
+        tpDraft = [attrs.tpDraft, attrs.tpDraftDate].filter(Boolean).join(' - ');
+        tpContact = attrs.tpContact || '';
+        tpCopyright = attrs.tpCopyright || '';
+        tpWgaRegistration = attrs.tpWgaRegistration || '';
+        tpNotes = attrs.tpNotes || '';
+        break;
+      }
+    }
+  }
+  if (tpTitle) {
+    lines.push(`      <Paragraph Type="General" Alignment="Center" SpaceBefore="288"><Text>${esc(tpTitle)}</Text></Paragraph>`);
+  }
+  if (tpWrittenBy) {
+    // The credit the writer chose, not a fixed "Written by" — a script credited
+    // "Screenplay by" said the wrong thing on every .fdx it was exported to.
+    lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpCredit)}</Text></Paragraph>`);
+    lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpWrittenBy)}</Text></Paragraph>`);
+    if (tpBasedOn) {
+      lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpBasedOn)}</Text></Paragraph>`);
+    }
+  }
+  if (tpDraft) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(tpDraft)}</Text></Paragraph>`);
+  }
+  if (tpContact) {
+    for (const line of tpContact.split('\n')) {
+      lines.push(`      <Paragraph Type="General" Alignment="Right"><Text>${esc(line)}</Text></Paragraph>`);
+    }
+  }
+  if (tpCopyright) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(tpCopyright)}</Text></Paragraph>`);
+  }
+  // The registration sits with the copyright, and the notes at the foot —
+  // matching what `deriveTitlePageLines` lays out on screen. Neither was
+  // written at all, so both were lost the moment a script was exported.
+  if (tpWgaRegistration) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(tpWgaRegistration)}</Text></Paragraph>`);
+  }
+  for (const line of tpNotes.split('\n').filter((l) => l.trim() !== '')) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(line)}</Text></Paragraph>`);
+  }
+  lines.push('    </Content>');
+  lines.push('  </TitlePage>');
+  lines.push('');
+  // A title page opened from a Final Draft file goes back as its own lines.
+  const freeTitleLines = (doc.content ?? []).filter((n) => n.type === 'titlePage');
+  if (freeTitleLines.some((n) => typeof n.attrs?.fdxXml === 'string' && n.attrs.fdxXml)) {
+    lines.splice(titleStart, lines.length - titleStart, ...buildFreeTitlePage(freeTitleLines), '');
+  }
+
+  // Script content — write all beats as Outline paragraphs before the script body
+  lines.push('  <Content>');
+
+  // Write beats grouped by column, in column order
+  if (beats && beats.length > 0) {
+    const sortedCols = beatColumns
+      ? [...beatColumns].sort((a, b) => a.position - b.position)
+      : [];
+    const colIds = new Set(sortedCols.map((c) => c.id));
+    // Group beats by columnId
+    const beatsByCol = new Map<string, BeatInfo[]>();
+    for (const beat of [...beats].sort((a, b) => a.position - b.position)) {
+      const arr = beatsByCol.get(beat.columnId) || [];
+      arr.push(beat);
+      beatsByCol.set(beat.columnId, arr);
+    }
+    // Write column-by-column
+    for (const col of sortedCols) {
+      const colBeats = beatsByCol.get(col.id);
+      if (!colBeats || colBeats.length === 0) continue;
+      // Column header as Outline 1 section marker
+      lines.push(`    <Paragraph Type="Outline 1"><Text>${esc(col.title)}</Text></Paragraph>`);
+      for (const beat of colBeats) {
+        lines.push(`    <Paragraph Type="Outline 2"><Text>${esc(beat.title)}</Text></Paragraph>`);
+        if (beat.description) {
+          for (const descLine of beat.description.split('\n')) {
+            lines.push(`    <Paragraph Type="Outline Body"><Text>${esc(descLine)}</Text></Paragraph>`);
+          }
+        }
+      }
+    }
+    // Beats in unknown columns (orphaned)
+    for (const [colId, colBeats] of beatsByCol) {
+      if (colIds.has(colId)) continue;
+      for (const beat of colBeats) {
+        lines.push(`    <Paragraph Type="Outline 1"><Text>${esc(beat.title)}</Text></Paragraph>`);
+        if (beat.description) {
+          for (const descLine of beat.description.split('\n')) {
+            lines.push(`    <Paragraph Type="Outline Body"><Text>${esc(descLine)}</Text></Paragraph>`);
+          }
+        }
+      }
+    }
+  }
+
+  // Helper: emit a single Paragraph element
+  const contdMarker = autoContdMarker(pageLayout);
+  const emitParagraph = (node: JSONContent, indent: string, noteTexts: readonly string[] = []) => {
+    const fdxType = resolveFdxExportType(node);
+    const paraAttrs: string[] = [`Type="${fdxType}"`];
+    // The paragraph's identity from the opened file, written back as it was
+    // (Final Draft itself writes some ids twice, so repeats are kept).
+    const fdxId = typeof node.attrs?.fdxId === 'string' ? node.attrs.fdxId : '';
+    if (fdxId) paraAttrs.push(`id="${esc(fdxId)}"`);
+
+    // Hidden numbers are not printed numbers. Locked ones are kept on the
+    // scenes while hidden, so they are left out here rather than by clearing.
+    if (node.attrs?.sceneNumber && options.sceneNumbersVisible !== false) paraAttrs.push(`Number="${node.attrs.sceneNumber}"`);
+    if (node.attrs?.textAlign) {
+      const a = ALIGNMENT_TO_FDX[node.attrs.textAlign as string];
+      if (a) paraAttrs.push(`Alignment="${a}"`);
+    }
+    if (node.attrs?.startsNewPage) paraAttrs.push('StartsNewPage="Yes"');
+
+    const attrStr = paraAttrs.join(' ');
+
+    if (node.content && node.content.length > 0) {
+      lines.push(`${indent}<Paragraph ${attrStr}>`);
+      // Printing script notes travel as Final Draft's own ScriptNote element.
+      //
+      // Be clear about what this is: Final Draft has no footnote. A ScriptNote
+      // is a NON-PRINTING annotation shown in its Notes pane, so the citation
+      // arrives with the script and is not lost, but Final Draft will not print
+      // it at the foot of the page the way the PDF does.
+      for (const text of noteTexts) {
+        lines.push(`${indent}  <ScriptNote>`);
+        lines.push(`${indent}    <Paragraph><Text>${esc(text)}</Text></Paragraph>`);
+        lines.push(`${indent}  </ScriptNote>`);
+      }
+      // Scene heading synopsis → SceneProperties/Summary (Final Draft format)
+      if (node.type === 'sceneHeading') {
+        const sp = sceneProperties(node.attrs?.fdxSceneProps, node.attrs?.synopsis, `${indent}  `);
+        if (sp) lines.push(sp);
+      }
+      // A Character paragraph must stay on one line — a break there would
+      // read as a second, phantom speaker. Collapse rather than encode.
+      const collapseBreaks = fdxType === 'Character';
+      // A block flagged for an edit with no text of its own (a deletion, an
+      // element change) puts its revision on its first run.
+      let blockRevision = typeof node.attrs?.revised === 'string' && node.attrs.revised ? node.attrs.revised : undefined;
+      // A character cue goes out as it was typed, without the automatic
+      // continued marker: Final Draft adds that itself when it prints.
+      let children: JSONContent[] = node.content;
+      if (fdxType === 'Character') {
+        const firstText = node.content.find((c) => c.type === 'text');
+        const full = node.content.map((c) => (c.type === 'text' ? (c.text ?? '') : ' ')).join('');
+        const stripped = stripAutoContd(full, contdMarker);
+        const typed = typeof node.attrs?.fdxText === 'string' ? node.attrs.fdxText : null;
+        const out = typed !== null && typed.trim().toUpperCase() === stripped.trim().toUpperCase()
+          ? typed
+          : (stripped !== full ? stripped : null);
+        if (out !== null) children = [{ type: 'text', text: out, marks: firstText?.marks }];
+      }
+      for (const child of children) {
+        if (child.type === 'hardBreak') {
+          if (!collapseBreaks) {
+            // A standalone Text run holding just the break, so the encoding
+            // is unambiguous and the neighbouring runs keep their own styling.
+            lines.push(`${indent}  <Text>&#10;</Text>`);
+          } else if (lines[lines.length - 1]?.includes('<Text')) {
+            lines.push(`${indent}  <Text> </Text>`);
+          }
+        } else if (child.type === 'text' && child.text) {
+          const ta = getTextAttributes(child.marks as MarkInfo[] | undefined, blockRevision);
+          blockRevision = undefined;
+          lines.push(`${indent}  <Text${ta}>${esc(child.text)}</Text>`);
+        }
+      }
+      lines.push(`${indent}</Paragraph>`);
+    } else if (noteTexts.length > 0) {
+      lines.push(`${indent}<Paragraph ${attrStr}>`);
+      for (const text of noteTexts) {
+        lines.push(`${indent}  <ScriptNote>`);
+        lines.push(`${indent}    <Paragraph><Text>${esc(text)}</Text></Paragraph>`);
+        lines.push(`${indent}  </ScriptNote>`);
+      }
+      lines.push(`${indent}  <Text></Text>`);
+      lines.push(`${indent}</Paragraph>`);
+    } else {
+      lines.push(`${indent}<Paragraph ${attrStr}><Text></Text></Paragraph>`);
+    }
+  };
+
+  // The last block that will actually be written out, so the general notes have
+  // something real to hang from.
+  const lastBodyIndex = doc.content
+    ? doc.content.reduce((last, node, idx) => (
+      isNonPrintingType(node.type) || node.type === 'screenplayImage' || node.type === 'titlePage'
+        ? last : idx
+    ), -1)
+    : -1;
+
+  // Location details have no field in Final Draft, so each rides as a Script Note on
+  // a scene heading. Only blocks that are written as plain paragraphs can carry one.
+  const locationNoteAt = options.locations
+    ? locationNoteTexts(
+      options.locations,
+      (doc.content ?? []).flatMap((n, index) => (
+        isNonPrintingType(n.type) || n.type === 'screenplayImage' || n.type === 'titlePage'
+          || n.type === 'dualDialogue' || n.type === 'avBlock'
+          ? [] : [{ index, heading: n.type === 'sceneHeading' ? jsonBlockText(n) : null }]
+      )),
+    )
+    : new Map<number, string[]>();
+
+  if (doc.content) {
+    for (let srcIndex = 0; srcIndex < doc.content.length; srcIndex++) {
+      const node = doc.content[srcIndex];
+      /** Citation text for the notes anchored in this block, if any. */
+      const noteTexts = (plan?.refsByNode.get(srcIndex) ?? [])
+        .map((ref) => plan!.entryById.get(ref.noteId))
+        .filter((e): e is NonNullable<typeof e> => !!e)
+        .map((e) => `${e.entryLabel}. ${e.blocks.map(noteBlockText).filter(Boolean).join(' ')}`.trim());
+      // General notes belong to the file, not to any line of it, and Final Draft
+      // has nowhere to put such a thing. Rather than drop them, they ride on the
+      // last paragraph of the script — which is as near to "the end" as the
+      // format allows.
+      if (plan && srcIndex === lastBodyIndex) {
+        for (const e of plan.generalEntries) {
+          const body = e.blocks.map(noteBlockText).filter(Boolean).join(' ');
+          noteTexts.push(`${e.entryLabel}. ${e.title ? `${e.title} — ` : ''}${body}`.trim());
+        }
+      }
+      const locationNotes = locationNoteAt.get(srcIndex);
+      if (locationNotes) noteTexts.push(...locationNotes);
+      // FDX has no representation for inserted images — skip them.
+      // Fountain's non-printing structure has no Final Draft equivalent that
+      // stays off the page — a Paragraph of any type prints — so it is left out
+      // rather than smuggled in as Action.
+      if (isNonPrintingType(node.type)) continue;
+      if (node.type === 'screenplayImage') continue;
+      // The title page has already been written to <TitlePage><Content>, which
+      // is where Final Draft looks for it. Emitting these here as well put the
+      // title, credit and copyright at the top of the script body — reopening
+      // the exported file showed the title page on script page 1, which is the
+      // very thing to avoid.
+      if (node.type === 'titlePage') continue;
+      if (node.type === 'dualDialogue') {
+        // Wrap in DualDialogue element — flatten columns into paragraphs
+        lines.push('    <DualDialogue>');
+        if (node.content) {
+          for (const col of node.content) {
+            if (col.type === 'dualDialogueColumn' && col.content) {
+              for (const child of col.content) {
+                emitParagraph(child, '      ');
+              }
+            }
+          }
+        }
+        lines.push('    </DualDialogue>');
+      } else if (node.type === 'avBlock') {
+        // AV block: emit each row as a pair of General paragraphs with custom attrs.
+        // FDX-aware DraftCraft instances re-import this back into avBlock; Final Draft
+        // sees a flat sequence of General paragraphs (acceptable degradation).
+        if (node.content) {
+          let rowIdx = 0;
+          for (const row of node.content) {
+            if (row.type !== 'avRow' || !row.content) continue;
+            const rowId = `r${rowIdx++}`;
+            for (const cell of row.content) {
+              if (cell.type !== 'avCell' || !cell.content) continue;
+              const side = (cell.attrs as { side?: string } | undefined)?.side || 'video';
+              for (const para of cell.content) {
+                // Hard breaks come through as newlines, which esc() encodes as
+                // &#10; — the same in-paragraph break encoding used above.
+                const text = jsonBlockText(para);
+                // A cell holds ordinary screenplay elements too, when the
+                // active template allows it. Those have a real FDX type, so
+                // they get it: Final Draft then shows a Character as a
+                // Character instead of one more line of General. The four AV
+                // paragraph types have no FDX equivalent and stay General,
+                // which is what this export has always degraded them to.
+                const fdxType = resolveFdxExportType(para);
+                lines.push(`    <Paragraph Type="${esc(fdxType)}" data-av-side="${esc(side)}" data-av-row-id="${esc(rowId)}" data-av-style="${esc(para.type || 'avPara')}"><Text>${esc(text)}</Text></Paragraph>`);
+              }
+            }
+          }
+        }
+      } else {
+        emitParagraph(node, '    ', noteTexts);
+      }
+    }
+  }
+
+  lines.push('  </Content>');
+
+  // CastList (Final Draft character descriptions)
+  if (characterProfiles && characterProfiles.length > 0) {
+    lines.push('');
+    lines.push('  <CastList>');
+    for (const p of characterProfiles) {
+      const plainDesc = foldCastDescription(p, stripHtml);
+      if (plainDesc) {
+        lines.push(`    <CastMember>`);
+        lines.push(`      <Name>${esc(p.name)}</Name>`);
+        lines.push(`      <Description>${esc(plainDesc)}</Description>`);
+        lines.push(`    </CastMember>`);
+      }
+    }
+    lines.push('  </CastList>');
+
+    // CharacterHighlighting
+    lines.push('');
+    lines.push('  <CharacterHighlighting>');
+    for (const p of characterProfiles) {
+      // Final Draft lists every character, writing a placeholder where no
+      // colour is set, and calls the on/off switch `Visible`.
+      const colour = /^#[0-9a-f]{6}$/i.test(p.color) ? fdx48(p.color) : '#RRRRGGGGBBBB';
+      lines.push(`    <Character Color="${esc(colour)}" Name="${esc(p.name)}" Visible="${p.highlighted ? 'Yes' : 'No'}"/>`);
+    }
+    lines.push('  </CharacterHighlighting>');
+  }
+
+  // TagData (production breakdown tags)
+  if (tagCategories && tags && tags.length > 0) {
+    const usedCatIds = new Set(tags.map((t) => t.categoryId));
+    const usedCats = tagCategories.filter((c) => usedCatIds.has(c.id));
+
+    lines.push('');
+    lines.push('  <TagData>');
+    lines.push('    <TagCategories>');
+    for (const cat of usedCats) {
+      lines.push(`      <TagCategory CatId="${esc(cat.id)}" Name="${esc(cat.name)}" Color="${esc(cat.color)}"/>`);
+    }
+    lines.push('    </TagCategories>');
+    lines.push('    <TagItems>');
+    for (const tag of tags) {
+      lines.push(`      <TagItem TagId="${esc(tag.id)}" CatId="${esc(tag.categoryId)}" Label="${esc(tag.name || tag.text)}"/>`);
+    }
+    lines.push('    </TagItems>');
+    lines.push('  </TagData>');
+  }
+
+  // DisplayBoards — Beat Board canvas metadata
+  if (beats && beats.length > 0) {
+    lines.push('');
+    lines.push('  <DisplayBoards>');
+    lines.push('    <DisplayBoard Height="55" ScrollOrigin="0,0" Type="StoryMap" Width="2032" ZoomLevel="100.000"/>');
+    lines.push('    <DisplayBoard Height="10000" ScrollOrigin="0,0" Type="Beat" Width="24000" ZoomLevel="100.000"/>');
+    lines.push('  </DisplayBoards>');
+  }
+
+  lines.push(...buildRevisions(doc, revisions));
+
+  lines.push('</FinalDraft>');
+
+  return lines.join('\n');
+}
+
+export async function downloadFDX(doc: JSONContent, title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont, footnotes?: FootnotePlan | null, revisions?: FDXRevisionState, options: FDXExportOptions = {}, fdxRaw?: FdxRaw | null) {
+  // The sections the file arrived with go back as they were, the same as a normal save.
+  const merged = mergeFdxRaw(
+    exportFDX(doc, title, characterProfiles, tagCategories, tags, beats, beatColumns, pageLayout, documentFont, footnotes, revisions, options),
+    fdxRaw ?? undefined,
+    settingsSignature(pageLayout, documentFont, characterProfiles),
+  );
+  // Black and white runs last, so the settings kept from the original file are covered too.
+  const xml = options.blackAndWhite ? toBlackAndWhiteFdx(merged) : merged;
+  const filename = `${sanitizeExportFilename(title)}.fdx`;
+  const { saveFile } = await import('./fileOps');
+  await saveFile(xml, filename, [{ name: 'Final Draft', extensions: ['fdx'] }]);
+}

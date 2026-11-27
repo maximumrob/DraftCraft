@@ -1,0 +1,113 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "DraftCraft",
+  "version": "0.0.42",
+  "identifier": "io.github.maximumrob.draftcraft",
+  "build": {
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "cd frontend && npm run dev",
+    "beforeBuildCommand": "cd frontend && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "splashscreen",
+        "url": "splash.html",
+        "title": "DraftCraft",
+        "width": 480,
+        "height": 420,
+        "resizable": false,
+        "decorations": false,
+        "center": true,
+        "transparent": true
+      },
+      {
+        "label": "main",
+        "url": "index.html",
+        "title": "DraftCraft",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' tauri://localhost asset://localhost https://asset.localhost http://asset.localhost; script-src 'self' tauri://localhost 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' tauri://localhost 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' tauri://localhost https://fonts.gstatic.com; img-src 'self' tauri://localhost asset://localhost https://asset.localhost http://asset.localhost https: data: blob:; connect-src 'self' tauri://localhost asset://localhost https://asset.localhost http://asset.localhost wss: ws: https: http://localhost:* http://127.0.0.1:*; frame-src https://www.youtube-nocookie.com https://player.vimeo.com blob:; media-src 'self' tauri://localhost asset://localhost https://asset.localhost http://asset.localhost blob:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/hidden-launcher.desktop",
+        "files": {
+          "/usr/share/applications/draftcraft.desktop": "linux/draftcraft.desktop",
+          "/usr/share/mime/packages/draftcraft.xml": "linux/draftcraft-mime.xml",
+          "/usr/share/icons/hicolor/48x48/mimetypes/application-x-dcraft.png": "linux/icons/png/application-x-dcraft-48.png",
+          "/usr/share/icons/hicolor/64x64/mimetypes/application-x-dcraft.png": "linux/icons/png/application-x-dcraft-64.png",
+          "/usr/share/icons/hicolor/128x128/mimetypes/application-x-dcraft.png": "linux/icons/png/application-x-dcraft-128.png",
+          "/usr/share/icons/hicolor/256x256/mimetypes/application-x-dcraft.png": "linux/icons/png/application-x-dcraft-256.png",
+          "/usr/share/icons/hicolor/48x48/mimetypes/application-x-fdx.png": "linux/icons/png/application-x-fdx-48.png",
+          "/usr/share/icons/hicolor/64x64/mimetypes/application-x-fdx.png": "linux/icons/png/application-x-fdx-64.png",
+          "/usr/share/icons/hicolor/128x128/mimetypes/application-x-fdx.png": "linux/icons/png/application-x-fdx-128.png",
+          "/usr/share/icons/hicolor/256x256/mimetypes/application-x-fdx.png": "linux/icons/png/application-x-fdx-256.png"
+        }
+      }
+    },
+    "category": "public.app-category.productivity",
+    "fileAssociations": [
+      {
+        "ext": ["dcraft"],
+        "mimeType": "application/x-dcraft",
+        "description": "DraftCraft Script"
+      },
+      {
+        "ext": ["fdx"],
+        "mimeType": "application/xml",
+        "description": "Final Draft Screenplay"
+      },
+      {
+        "ext": ["fountain"],
+        "mimeType": "text/plain",
+        "description": "Fountain Screenplay"
+      },
+      {
+        "ext": ["fadein"],
+        "mimeType": "application/zip",
+        "description": "Fade In Screenplay"
+      },
+      {
+        "ext": ["osf"],
+        "mimeType": "application/xml",
+        "description": "Open Screenplay Format"
+      },
+      {
+        "ext": ["txt"],
+        "mimeType": "text/plain",
+        "description": "Text File"
+      }
+    ]
+  },
+  "plugins": {}
+}

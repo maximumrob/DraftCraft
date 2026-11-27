@@ -1,0 +1,286 @@
+/**
+ * Generates dynamic CSS from a FormattingTemplate.
+ *
+ * When a custom template is active, this CSS is injected into the <head>
+ * to override the static rules in screenplay.css.
+ */
+
+import type { FormattingTemplate, FormattingElementRule } from '../stores/formattingTypes';
+import { ELEMENT_CSS_CLASS, titlePageFieldOf, isTitlePageRuleId, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
+import type { PageLayout } from '../stores/editorStore';
+import { fontStack } from './fonts';
+import { pageInk, pagePaper } from './inkColor';
+
+const STYLE_ELEMENT_ID = 'draftcraft-template-css';
+
+/**
+ * Generate a complete CSS string from a template and page layout.
+ */
+export interface TemplateCssOptions {
+  /**
+   * Emit only the title page's rules.
+   *
+   * The industry-standard template is served by the static stylesheet rather
+   * than generated CSS, which is why it takes this path at all — but the title
+   * page has no static equivalent a template can drive, so its rules have to be
+   * emitted even there or a title-page font set in the template does nothing on
+   * the default template.
+   */
+  titlePageOnly?: boolean;
+}
+
+export function generateTemplateCss(
+  template: FormattingTemplate,
+  pageLayout: PageLayout,
+  options: TemplateCssOptions = {},
+): string {
+  const lines: string[] = [];
+
+  for (const [elementId, rule] of Object.entries(template.rules)) {
+    if (!rule.enabled) continue;
+    if (options.titlePageOnly && !isTitlePageRuleId(elementId)) continue;
+    // "AV Columns" is an insert action, not a paragraph type — there is no
+    // element on the page for its typography to land on.
+    if (elementId === AV_BLOCK_RULE_ID) continue;
+
+    const selector = getSelector(elementId, rule);
+    const props = generateRuleProperties(rule, pageLayout, AV_CELL_CSS_CLASS[elementId] !== undefined);
+    if (props.length > 0) {
+      lines.push(`${selector} {`);
+      for (const prop of props) {
+        lines.push(`  ${prop}`);
+      }
+      lines.push('}');
+      lines.push('');
+    }
+
+    // Dark Pages only: near-black text and near-white fill follow the page's
+    // ink and paper (utils/inkColor). Scoped to the mode, because on white
+    // paper a #333 text or #f0f0f0 band is a choice and must print as chosen.
+    const dark = darkPagesProperties(rule);
+    if (dark.length > 0) {
+      lines.push(`${DARK_PAGES_ROOT} ${selector} {`);
+      for (const prop of dark) lines.push(`  ${prop}`);
+      lines.push('}');
+      lines.push('');
+    }
+
+    // First-child override: remove margin-top
+    if (rule.marginTop > 0) {
+      lines.push(`${selector}:first-child { margin-top: 0; }`);
+      lines.push('');
+    }
+
+    // Placeholder
+    if (rule.placeholder) {
+      const placeholderSelector = getPlaceholderSelector(elementId, rule);
+      const pStyles: string[] = [];
+      pStyles.push(`content: '${escapeCssString(rule.placeholder)}';`);
+      pStyles.push('color: var(--page-ink-placeholder);');
+      pStyles.push('pointer-events: none;');
+      pStyles.push('float: left;');
+      pStyles.push('height: 0;');
+      if (rule.textTransform === 'uppercase') pStyles.push('text-transform: uppercase;');
+      if (rule.italic) pStyles.push('font-style: italic;');
+      lines.push(`${placeholderSelector} {`);
+      for (const s of pStyles) {
+        lines.push(`  ${s}`);
+      }
+      lines.push('}');
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * The four AV paragraph types and the class each renders with.
+ *
+ * They are not `screenplay-element`s and have no entry in `ELEMENT_CSS_CLASS`,
+ * so without this they fell through to the custom-element selector — which
+ * matches nothing, and left a template's AV typography with no effect at all.
+ * Restyling "Video Shot" in the Template Editor did nothing; the static rules
+ * in styles/avScript.css were the only thing drawing them.
+ */
+const AV_CELL_CSS_CLASS: Record<string, string> = {
+  avPara: 'av-para',
+  avShot: 'av-shot',
+  avDirection: 'av-direction',
+  avGraphic: 'av-graphic',
+};
+
+function getSelector(elementId: string, rule: FormattingElementRule): string {
+  // Title page elements are one node type distinguished by a `field` attribute,
+  // not a node type each, so they select on the class the node view renders.
+  const titleField = titlePageFieldOf(elementId);
+  if (titleField) return `.page .screenplay-element.title-page-${titleField}`;
+  // Two class levels deep, so this beats `.av-cell .av-shot` in avScript.css.
+  const avClass = AV_CELL_CSS_CLASS[elementId];
+  if (avClass) return `.page .av-cell .${avClass}`;
+  if (rule.isBuiltIn) {
+    const cssClass = ELEMENT_CSS_CLASS[elementId];
+    if (cssClass) {
+      return `.page .screenplay-element.${cssClass}`;
+    }
+  }
+  // Custom element
+  return `.page .screenplay-element.custom-element[data-custom-type="${elementId}"]`;
+}
+
+function getPlaceholderSelector(elementId: string, rule: FormattingElementRule): string {
+  const titleField = titlePageFieldOf(elementId);
+  if (titleField) return `div[data-type="title-page"][data-field="${titleField}"].is-empty::before`;
+  const avClass = AV_CELL_CSS_CLASS[elementId];
+  if (avClass) return `p[data-type="${avClass}"].is-empty::before`;
+  if (rule.isBuiltIn) {
+    const cssClass = ELEMENT_CSS_CLASS[elementId];
+    // The data-type uses the CSS class name (hyphenated)
+    return `div[data-type="${cssClass}"].is-empty::before`;
+  }
+  return `div[data-type="custom-element"][data-custom-type="${elementId}"].is-empty::before`;
+}
+
+/** The root selector Dark Pages is switched on under (styles/screenplay.css). */
+const DARK_PAGES_ROOT = ':root[data-dark-pages="on"]:not([data-theme="light"])';
+
+/** A template's colours that Dark Pages swaps for the page's ink and paper. */
+function darkPagesProperties(rule: FormattingElementRule): string[] {
+  const props: string[] = [];
+  if (rule.textColor && pageInk(rule.textColor) !== rule.textColor) {
+    props.push(`color: ${pageInk(rule.textColor)};`);
+  }
+  if (rule.backgroundColor && pagePaper(rule.backgroundColor) !== rule.backgroundColor) {
+    props.push(`background-color: ${pagePaper(rule.backgroundColor)};`);
+  }
+  return props;
+}
+
+function generateRuleProperties(
+  rule: FormattingElementRule,
+  pageLayout: PageLayout,
+  /** True for an element that lives inside an AV cell. Its indents are dropped:
+   *  they are measured from the PAGE edge, and a 3.7in dialogue indent inside a
+   *  column a couple of inches wide leaves no room for the text at all. */
+  inAvCell = false,
+): string[] {
+  const props: string[] = [];
+  const pl = pageLayout.leftMargin;
+  const pw = pageLayout.pageWidth;
+  const prMargin = pageLayout.rightMargin;
+
+  // Font family & size (null = use document default)
+  if (rule.fontFamily) {
+    // Fallbacks matched to the font's own shape, so an element set in a serif
+    // or display face doesn't drop to Courier on a machine without it.
+    props.push(`font-family: ${fontStack(rule.fontFamily)};`);
+  }
+  if (rule.fontSize != null) {
+    props.push(`font-size: ${rule.fontSize}pt;`);
+  }
+
+  // Text style
+  props.push(`font-weight: ${rule.bold ? 'bold' : 'normal'};`);
+  props.push(`font-style: ${rule.italic ? 'italic' : 'normal'};`);
+
+  // Text decoration (combine underline and strikethrough)
+  const decorations: string[] = [];
+  if (rule.underline) decorations.push('underline');
+  if (rule.strikethrough) decorations.push('line-through');
+  props.push(`text-decoration: ${decorations.length > 0 ? decorations.join(' ') : 'none'};`);
+
+  // Text transform
+  props.push(`text-transform: ${rule.textTransform};`);
+
+  // Alignment
+  props.push(`text-align: ${rule.textAlign};`);
+
+  // Margin
+  if (rule.marginTop > 0) {
+    props.push(`margin-top: ${rule.marginTop}pt;`);
+  } else {
+    props.push('margin-top: 0;');
+  }
+
+  if (inAvCell) return props;
+
+  // Indents — use calc() with CSS variables for responsive layout
+  const leftPad = rule.leftIndent - pl;
+  if (leftPad > 0.01) {
+    props.push(`padding-left: calc(${rule.leftIndent}in - var(--pl, ${pl}in));`);
+  } else {
+    props.push('padding-left: 0;');
+  }
+
+  const rightPad = pw - rule.rightIndent - prMargin;
+  if (rightPad > 0.01) {
+    props.push(`padding-right: calc(var(--pw, ${pw}in) - ${rule.rightIndent}in - var(--pr, ${prMargin}in));`);
+  } else {
+    props.push('padding-right: 0;');
+  }
+
+  // Colors, exactly as the template chose them. Dark Pages adds its own rule
+  // (darkPagesProperties) so a plain black or white can follow the page there
+  // without a deliberate grey changing anywhere else.
+  if (rule.textColor) {
+    props.push(`color: ${rule.textColor};`);
+  }
+  if (rule.backgroundColor) {
+    props.push(`background-color: ${rule.backgroundColor};`);
+  }
+
+  return props;
+}
+
+function escapeCssString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\A ');
+}
+
+/**
+ * Inject or update the dynamic template CSS in the document head.
+ * Call with null to remove the injected styles.
+ */
+export function injectTemplateCss(css: string | null): void {
+  let el = document.getElementById(STYLE_ELEMENT_ID) as HTMLStyleElement | null;
+
+  if (css === null) {
+    if (el) el.remove();
+    return;
+  }
+
+  if (!el) {
+    el = document.createElement('style');
+    el.id = STYLE_ELEMENT_ID;
+    document.head.appendChild(el);
+  }
+
+  el.textContent = css;
+}
+
+/**
+ * Colour-only rules for a template.
+ *
+ * The default Film Screenplay template is drawn by the static stylesheet, so
+ * generateTemplateCss is skipped for its body elements. Its element colours
+ * still have to reach the page, and this emits just those.
+ */
+export function generateTemplateColorCss(
+  template: FormattingTemplate,
+  pageLayout: PageLayout,
+): string {
+  const lines: string[] = [];
+  for (const [elementId, rule] of Object.entries(template.rules)) {
+    if (!rule.enabled) continue;
+    if (isTitlePageRuleId(elementId) || elementId === AV_BLOCK_RULE_ID) continue;
+    const selector = getSelector(elementId, rule);
+    if (!rule.isBuiltIn) {
+      // A custom element has no rule in the static stylesheet, so it needs its
+      // full typography here, not just its colour.
+      const props = generateRuleProperties(rule, pageLayout, false);
+      if (props.length > 0) lines.push(`${selector} { ${props.join(' ')} }`);
+    } else if (rule.textColor) {
+      lines.push(`${selector} { color: ${rule.textColor}; }`);
+    }
+  }
+  return lines.join('\n');
+}

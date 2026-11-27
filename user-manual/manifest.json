@@ -1,0 +1,41 @@
+{
+  "version": "9578341007d7817a",
+  "pages": [
+    {
+      "slug": "index.html",
+      "title": "Home",
+      "section": "Getting Started",
+      "hash": "bce578500ea94e8a"
+    },
+    {
+      "slug": "getting-started.html",
+      "title": "Getting Started",
+      "section": "Getting Started",
+      "hash": "276df5d9e63f5079"
+    },
+    {
+      "slug": "saving-and-formats.html",
+      "title": "Saving and File Formats",
+      "section": "Files",
+      "hash": "4c7f75de8ceee94e"
+    },
+    {
+      "slug": "characters-and-pictures.html",
+      "title": "Characters and Pictures",
+      "section": "Characters",
+      "hash": "eccb6a2f892d75be"
+    },
+    {
+      "slug": "working-together.html",
+      "title": "Working Together",
+      "section": "Collaboration",
+      "hash": "f1d507259e1eb9ae"
+    },
+    {
+      "slug": "help.html",
+      "title": "Help and Feedback",
+      "section": "Help",
+      "hash": "ce4af8886bc14220"
+    }
+  ]
+}

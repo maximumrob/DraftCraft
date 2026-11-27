@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "Read by the in-app update notice. Served by raw.githubusercontent.com from the",
+    "main branch of maximumrob/DraftCraft, so it goes live as soon as it is pushed.",
+    "",
+    "Bump a channel ONLY once that channel's release is actually downloadable.",
+    "A channel with no entry here simply never shows a notice."
+  ],
+  "channels": {
+    "linux": {
+      "version": "0.0.42",
+      "url": "https://github.com/maximumrob/DraftCraft/releases/latest"
+    },
+    "dmg": {
+      "version": "0.0.42",
+      "url": "https://github.com/maximumrob/DraftCraft/releases/latest"
+    },
+    "win": {
+      "version": "0.0.42",
+      "url": "https://github.com/maximumrob/DraftCraft/releases/latest"
+    }
+  }
+}

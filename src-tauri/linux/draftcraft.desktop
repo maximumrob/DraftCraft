@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DraftCraft
+Comment=DraftCraft - Professional Screenwriting Application
+Exec=draftcraft %F
+Icon=draftcraft
+Terminal=false
+Categories=Office;
+StartupWMClass=draftcraft
+MimeType=application/x-dcraft;application/x-fdx;text/x-fountain;application/x-fadein;application/x-osf;

@@ -1,0 +1,86 @@
+/**
+ * Forced page breaks — shared by the PDF and DOCX exporters so both agree with
+ * the editor's pagination plugin (editor/pagination.ts).
+ *
+ * An element opens a new page when either:
+ *   - the writer flagged it manually (`startsNewPage` attribute, Format →
+ *     Start On New Page), or
+ *   - the active formatting template lists its element id in `forceBreakBefore`
+ *     (e.g. TV formats break before every New Act).
+ */
+
+import type { JSONContent } from '@tiptap/react';
+import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
+import { startsLockedPage } from './lockedPages';
+
+/** Minimal node shape both exporters can satisfy. */
+export interface BreakableNode {
+  type?: string;
+  attrs?: Record<string, unknown> | null;
+}
+
+/** Effective element id — custom elements are keyed by their template rule id. */
+export function elementIdOf(node: BreakableNode): string {
+  const typeName = node.type || 'general';
+  if (typeName === 'customElement') {
+    const id = node.attrs?.customTypeId;
+    if (typeof id === 'string' && id) return id;
+  }
+  return typeName;
+}
+
+/**
+ * Element ids the active formatting template requires to start a new page.
+ * Read lazily and defensively: exporters must still produce a document when the
+ * template store has not been hydrated (tests, headless export).
+ */
+export function getForceBreakIds(): Set<string> {
+  try {
+    const tpl = useFormattingTemplateStore.getState().getActiveTemplate();
+    return new Set(tpl.forceBreakBefore ?? []);
+  } catch (err) {
+    console.warn('[pageBreaks] could not read template page-break rules', err);
+    return new Set();
+  }
+}
+
+/**
+ * True when this node must open its own page.
+ *
+ * `lockedPages` also honours a locked page's anchor (utils/lockedPages). Only
+ * the paginated outputs ask for it — the editor and the PDF. Word lays its own
+ * pages out, and a forced break at every page we would have turned is how a
+ * DOCX ends up with half-empty sheets.
+ */
+export function startsOwnPage(
+  node: BreakableNode,
+  forceBreakIds: Set<string>,
+  opts: { lockedPages?: boolean } = {},
+): boolean {
+  if (node.attrs?.startsNewPage === true) return true;
+  if (opts.lockedPages && startsLockedPage(node.attrs)) return true;
+  return forceBreakIds.has(elementIdOf(node));
+}
+
+/** Convenience wrapper for callers holding Tiptap JSON. */
+export function jsonStartsOwnPage(node: JSONContent, forceBreakIds: Set<string>): boolean {
+  return startsOwnPage(node as BreakableNode, forceBreakIds);
+}
+
+/**
+ * Elements that are not a run of text and are drawn by a pass of their own —
+ * an AV table with its own row pagination, a dual-dialogue pair of columns, an
+ * inserted picture.
+ *
+ * They must never be swallowed into another element's block. A scene heading
+ * takes the element after it so it is not orphaned at a page foot, and taking
+ * one of these meant the exporter measured it as the empty run its flattened
+ * text comes to, drew that nothing in place of the block, and skipped the pass
+ * that would have drawn it properly — which is how a dual-dialogue exchange
+ * introduced by a scene heading disappeared from the PDF.
+ */
+const SELF_LAYOUT_TYPES = new Set(['avBlock', 'dualDialogue', 'screenplayImage']);
+
+export function laysItselfOut(typeName: string): boolean {
+  return SELF_LAYOUT_TYPES.has(typeName);
+}

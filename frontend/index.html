@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- SVG first so browsers that support it get the crisp mark; the .ico is
+         the fallback for those that don't. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- viewport-fit=cover is what makes env(safe-area-inset-*) report real
+         values.  Without it touch browsers resolve every inset to 0 and the app chrome can render underneath system UI.
+         It is inert where there are no insets, so desktop and web are
+         unaffected. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>DraftCraft - Screenwriting</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Set by main.tsx the moment it is about to mount React. Until then a
+      // thrown error or a rejected promise means the app never started, and
+      // the overlay below is the only way the user sees why. Afterwards it
+      // means something inside a running app went wrong — a failed export, a
+      // command the platform does not implement — and covering
+      // the editor with an unclosable overlay loses the writer's session and
+      // forces a force-quit. Past this flag the console is enough.
+      window.__odBooted = false;
+
+      // Catch fatal JS errors that prevent React from mounting.
+      // Shows a visible error overlay instead of a blank screen.
+      window.addEventListener('error', function(e) {
+        if (window.__odBooted) return;
+        var d = document.getElementById('_fatal');
+        if (!d) {
+          d = document.createElement('div');
+          d.id = '_fatal';
+          d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff6b6b;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
+          d.innerHTML = '<h2 style="color:#fff;margin-bottom:12px;">DraftCraft failed to start</h2>';
+          document.body.appendChild(d);
+        }
+        d.innerHTML += '\n[ERROR] ' + (e.message || e) + '\n  at ' + (e.filename || '?') + ':' + (e.lineno || '?') + '\n';
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        if (window.__odBooted) return;
+        var d = document.getElementById('_fatal');
+        if (!d) {
+          d = document.createElement('div');
+          d.id = '_fatal';
+          d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff6b6b;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
+          d.innerHTML = '<h2 style="color:#fff;margin-bottom:12px;">DraftCraft failed to start</h2>';
+          document.body.appendChild(d);
+        }
+        var msg = e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : 'Unknown rejection';
+        d.innerHTML += '\n[UNHANDLED REJECTION] ' + msg + '\n';
+      });
+      // Timeout: if nothing renders in 8 seconds, show a diagnostic
+      window._renderTimeout = setTimeout(function() {
+        if (!document.getElementById('root').children.length) {
+          var d = document.getElementById('_fatal');
+          if (!d) {
+            d = document.createElement('div');
+            d.id = '_fatal';
+            d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff9f43;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
+            document.body.appendChild(d);
+          }
+          d.innerHTML += '<h2 style="color:#fff;margin-bottom:12px;">DraftCraft: Loading timed out</h2>';
+          d.innerHTML += 'The app did not render within 8 seconds.\n';
+          d.innerHTML += 'Tauri IPC available: ' + !!(window.__TAURI_INTERNALS__) + '\n';
+          d.innerHTML += 'User agent: ' + navigator.userAgent + '\n';
+          d.innerHTML += 'Location: ' + location.href + '\n';
+        }
+      }, 8000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
